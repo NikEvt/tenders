@@ -1,0 +1,15 @@
+{
+  "tenders_total": 149860,
+  "tenders_candidate": 31021,
+  "attachments_total": 198377,
+  "attachments_by_status": {
+    "deferred": 19240,
+    "done": 115313,
+    "failed": 109,
+    "pending": 63714,
+    "skipped": 1
+  },
+  "hits_total": 333,
+  "tenders_with_hits": 76,
+  "crawl_days": 661
+}

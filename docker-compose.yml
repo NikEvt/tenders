@@ -1,0 +1,435 @@
+name: zakupki
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-zakupki}
+  POSTGRES_USER: ${POSTGRES_USER:-zakupki}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен, см. .env.example}
+
+x-mq-env: &mq-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_USER: ${RABBITMQ_USER:-zakupki}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD обязателен}
+
+x-minio-env: &minio-env
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zakupki}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD обязателен}
+  MINIO_BUCKET: ${MINIO_BUCKET:-tender-documents}
+  MINIO_SECURE: "false"
+
+x-log-env: &log-env
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: ${LOG_JSON:-true}
+
+# ─── Бюджет ресурсов ──────────────────────────────────────────────────────────
+# Весь стек рассчитан на 4 CPU. Лимиты — не тонкая настройка, а страховка:
+# без них разбор пары тысяч документов забирает всю машину. Так и вышло —
+# OCR, LibreOffice и torch независимо решили, что ядер у них столько, сколько
+# на хосте, и система встала.
+#
+# Лимит — потолок, а не резерв: простаивающий сервис ничего не занимает.
+# Тяжёлая тройка (docs-worker, embedding-service, postgres) укладывается
+# в 4 CPU, остальным оставлены доли, которых хватает отвечать на запросы.
+#
+# Ограничения парные: cgroup режет процесс снаружи, а переменные потоков не
+# дают библиотекам плодить потоки, которые всё равно не получат времени.
+# Одного cgroup мало — оверсабскрайб внутри квоты медленнее, чем её отсутствие.
+# Потолки памяти. Ограничения по CPU сняты намеренно: они резали пиковую
+# скорость, ничего при этом не гарантируя — систему клала не загрузка ядер,
+# а память. Планировщик ядра делит процессор сам и делает это лучше квот.
+#
+# Сумма потолков — 8.1 ГиБ при 10 ГиБ у виртуальной машины. Разница оставлена
+# ядру VM, dockerd и сборщику: если сумма упрётся в размер машины, арбитром
+# станет OOM-killer, а он выбирает жертву хуже, чем это делают лимиты.
+#
+# Потолок — не резерв: простаивающий сервис ничего не занимает.
+x-limits-embedding: &limits-embedding
+  deploy:
+    resources:
+      limits: { memory: 3072m }
+
+# OCR разворачивает страницы сканов в растр, LibreOffice поднимает свой
+# процесс на конвертацию — полутора гигабайт хватает на крупный PDF.
+x-limits-worker: &limits-worker
+  deploy:
+    resources:
+      limits: { memory: 1536m }
+
+x-limits-db: &limits-db
+  deploy:
+    resources:
+      limits: { memory: 1024m }
+
+x-limits-broker: &limits-broker
+  deploy:
+    resources:
+      limits: { memory: 512m }
+
+x-limits-storage: &limits-storage
+  deploy:
+    resources:
+      limits: { memory: 320m }
+
+x-limits-gateway: &limits-gateway
+  deploy:
+    resources:
+      limits: { memory: 448m }
+
+x-limits-ui: &limits-ui
+  deploy:
+    resources:
+      limits: { memory: 448m }
+
+x-limits-small: &limits-small
+  deploy:
+    resources:
+      limits: { memory: 256m }
+
+x-limits-tiny: &limits-tiny
+  deploy:
+    resources:
+      limits: { memory: 192m }
+
+# Число потоков внутри библиотек, использующих OpenMP (tesseract, torch, BLAS).
+# Квот по CPU больше нет, но ограничение осталось: по умолчанию эти библиотеки
+# поднимают поток на каждое ядро хоста, и десять потоков на одном документе
+# не ускоряют разбор, зато отнимают процессор у всей машины.
+x-threads-worker: &threads-worker
+  OMP_NUM_THREADS: "2"
+  OMP_THREAD_LIMIT: "2"
+  OPENBLAS_NUM_THREADS: "2"
+
+x-threads-heavy: &threads-heavy
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  OPENBLAS_NUM_THREADS: "4"
+  TOKENIZERS_PARALLELISM: "false"
+
+x-infra-ready: &infra-ready
+  postgres:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+services:
+  # ─── Инфраструктура ─────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: *limits-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zakupki}
+      POSTGRES_USER: ${POSTGRES_USER:-zakupki}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD обязателен}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Только расширения; вся схема — через Alembic.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zakupki} -d ${POSTGRES_DB:-zakupki}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    <<: *limits-broker
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-zakupki}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD обязателен}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      # Пусковое окно: под квотой CPU нода Erlang поднимается заметно дольше,
+      # и без этого зависимые сервисы падают на «нездоровом» брокере.
+      start_period: 180s
+
+  minio:
+    image: minio/minio:latest
+    <<: *limits-storage
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zakupki}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD обязателен}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-zakupki} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-tender-documents} &&
+      echo 'bucket ready'
+      "
+    restart: "no"
+
+  # ─── Миграции: должны отработать до старта сервисов ─────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: migrate
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: [*db-env, *log-env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── Прикладные сервисы ─────────────────────────────────────────────────────
+  crawler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+      args:
+        EXTRAS: crawler
+    command: ["python", "-m", "services.crawler"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+      EIS_TOKEN: ${EIS_TOKEN:-}
+      EIS_REGIONS: ${EIS_REGIONS:-77}
+      EIS_DOCUMENT_TYPES: ${EIS_DOCUMENT_TYPES:-epNotificationEF2020}
+      EIS_CRAWL_INTERVAL_MINUTES: ${EIS_CRAWL_INTERVAL_MINUTES:-60}
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  docs-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: docs
+    command: ["python", "-m", "services.docs_worker"]
+    # Самый прожорливый сервис стека: OCR через tesseract, конвертация
+    # устаревших форматов через LibreOffice, распаковка архивов.
+    <<: *limits-worker
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env, *threads-worker]
+      EIS_TOKEN: ${EIS_TOKEN:-}
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding-service:8020}
+      # Аварийный рычаг: придержать очередь, не трогая уровень нагрузки целиком.
+      # По умолчанию **пусто** — тогда prefetch считается от уровня вместе с
+      # размером пула. Значение по умолчанию здесь стояло бы всегда и молча
+      # отменяло бы уровень: рычаг оказался бы вечно вытянутым.
+      DOCS_WORKER_PREFETCH: ${DOCS_WORKER_PREFETCH:-}
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # На Apple Silicon считает на CPU: Docker Desktop работает в Linux-VM,
+  # куда Metal не пробрасывается. Для инференса на MPS запускайте сервис
+  # нативно на хосте — см. README, раздел «Эмбеддинги на Apple Silicon».
+  embedding-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: embedding
+    command:
+      ["uvicorn", "services.embedding_service.presentation.app:app",
+       "--host", "0.0.0.0", "--port", "8020"]
+    <<: *limits-embedding
+    environment:
+      <<: [*db-env, *mq-env, *log-env, *threads-heavy]
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-deepvk/USER-bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-}
+      EMBEDDING_PREFETCH: ${EMBEDDING_PREFETCH:-2}
+      HF_HOME: /models
+    volumes:
+      # Модель ~2 ГБ: том бережёт и время старта, и трафик при пересборке.
+      - modelcache:/models
+    ports:
+      - "8020:8020"
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  llm-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+      args:
+        EXTRAS: llm
+    command:
+      ["uvicorn", "services.llm_service.presentation.app:app",
+       "--host", "0.0.0.0", "--port", "8010"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8080/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-dummy}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-35B-A3B}
+      LLM_AUTH_SCHEME: ${LLM_AUTH_SCHEME:-Bearer}
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-4}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-none}
+      LLM_JUDGE_REASONING_EFFORT: ${LLM_JUDGE_REASONING_EFFORT:-low}
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding-service:8020}
+    ports:
+      - "8010:8010"
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Движок отбора: ищет упоминания по накопленному тексту, решает уверенные
+  # случаи правилами и зовёт модель только к спорным. Модели своей не имеет —
+  # ходит в llm-service по HTTP.
+  research:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+      args:
+        EXTRAS: api
+    command: ["python", "-m", "services.research"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env]
+      LLM_SERVICE_URL: ${LLM_SERVICE_URL:-http://llm-service:8010}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-35B-A3B}
+      # Уровень нагрузки читается из БД и меняется на лету; переменная задаёт
+      # лишь то, с чего сервис стартует.
+      LOAD_LEVEL: ${LOAD_LEVEL:-2}
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  recsys-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+      args:
+        EXTRAS: recsys
+    command:
+      ["uvicorn", "services.recsys_service.presentation.app:app",
+       "--host", "0.0.0.0", "--port", "8030"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding-service:8020}
+    ports:
+      - "8030:8030"
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+      args:
+        EXTRAS: api
+    # main:app, а не presentation.app:app — presentation больше не знает, чем
+    # закрыты порты; связывает их composition root.
+    command:
+      ["uvicorn", "services.api.main:app",
+       "--host", "0.0.0.0", "--port", "8000"]
+    <<: *limits-gateway
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env]
+      # Мониторинг очередей ходит в management API брокера.
+      RABBITMQ_MANAGEMENT_PORT: ${RABBITMQ_MANAGEMENT_PORT:-15672}
+      EIS_TOKEN: ${EIS_TOKEN:-}
+      LLM_SERVICE_URL: http://llm-service:8010
+      RECSYS_SERVICE_URL: http://recsys-service:8030
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding-service:8020}
+    ports:
+      - "8000:8000"
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Основной интерфейс. Заменяет dashboard в рабочем сценарии.
+  web:
+    build:
+      context: ./web
+      dockerfile: ../docker/Dockerfile.web
+      args:
+        # Адрес, по которому API виден из браузера, а не из сети compose:
+        # `http://api:8000` браузеру недоступен. Значение вшивается в бандл
+        # на этапе сборки — после смены нужно пересобрать образ.
+        NEXT_PUBLIC_API_URL: ${WEB_API_URL:-http://localhost:8000}
+    <<: *limits-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # Временный интерфейс на Streamlit. Остаётся как запасной путь к тем данным,
+  # для которых в API ещё нет эндпоинтов (см. web/docs/API-GAPS.md).
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: dashboard
+    command:
+      ["streamlit", "run", "dashboard/app.py",
+       "--server.port", "8501", "--server.address", "0.0.0.0"]
+    <<: *limits-tiny
+    environment:
+      <<: *log-env
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  miniodata:
+  modelcache:

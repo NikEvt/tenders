@@ -1,0 +1,174 @@
+[project]
+name = "zakupki"
+version = "0.1.0"
+description = "Анализ и рекомендации тендеров 44-ФЗ (ЕИС zakupki.gov.ru)"
+requires-python = ">=3.12"
+
+# Ядро — то, что нужно всем сервисам без исключения.
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+    "aio-pika>=9.4",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "asyncpg>=0.30",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "pgvector>=0.3",
+    "tenacity>=9.0",
+]
+
+[project.optional-dependencies]
+# Каждый сервис ставит только свой extra — тяжёлые зависимости не расползаются по образам.
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    # Шлюз сам файлы не читает, но выдаёт presigned-ссылки на них.
+    "minio>=7.2",
+]
+crawler = [
+    "requests>=2.32",
+    "urllib3>=2.2",
+    "xmltodict>=0.14",
+    "lxml>=5.3",
+]
+docs = [
+    "requests>=2.32",
+    "httpx>=0.27",
+    "minio>=7.2",
+    "pypdfium2>=4.30",
+    "pdfminer.six>=20240706",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "striprtf>=0.0.26",
+    "pytesseract>=0.3.13",
+    "pillow>=10.4",
+    "py7zr>=0.22",
+    "rarfile>=4.2",
+    "python-magic>=0.4.27",
+]
+embedding = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sentence-transformers>=3.2",
+    "torch>=2.4",
+]
+llm = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "openai>=1.54",
+    "httpx>=0.27",
+]
+recsys = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "numpy>=2.0",
+]
+dashboard = [
+    "streamlit>=1.39",
+    "httpx>=0.27",
+    "pandas>=2.2",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "testcontainers[postgres,rabbitmq,minio]>=4.8",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "import-linter>=2.1",
+    "types-requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["libs/shared", "services"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# legacy/ — код до рефакторинга, оставлен для сверки и в сборку не входит.
+extend-exclude = ["legacy", "venv", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # кириллица в строках/комментариях — это норма для проекта
+
+[tool.ruff.lint.per-file-ignores]
+# Тела миграций генерируются автоматически — переформатировать их вручную
+# значит расходиться с тем, что выдаёт alembic на следующей ревизии.
+"migrations/versions/*" = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Движок БД живёт на всю сессию, поэтому и цикл событий должен быть один:
+# при функциональном скоупе пул asyncpg остаётся привязан к уже закрытому циклу.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+
+# Строгий режим — только для слоёв, где живут бизнес-правила.
+[[tool.mypy.overrides]]
+module = ["services.*.domain.*", "services.*.application.*", "libs.shared.*"]
+strict = true
+
+# У openpyxl нет типов в поставке, а `types-openpyxl` тянуть в рабочие образы
+# ради одного модуля выгрузки незачем: библиотека используется только на
+# границе, в сборке отчёта.
+[[tool.mypy.overrides]]
+module = ["openpyxl.*"]
+ignore_missing_imports = true
+
+# ─── Контроль архитектуры: слои не должны разъезжаться ────────────────────────
+[tool.importlinter]
+root_packages = ["services", "libs"]
+
+[[tool.importlinter.contracts]]
+name = "Слои внутри сервисов: presentation -> application -> domain"
+type = "layers"
+layers = ["presentation", "infrastructure", "application", "domain"]
+containers = [
+    "services.api",
+    "services.crawler",
+    "services.docs_worker",
+    "services.llm_service",
+    "services.embedding_service",
+    "services.recsys_service",
+    "services.research",
+]
+
+[[tool.importlinter.contracts]]
+# Слоёв мало: они разрешают presentation импортировать infrastructure напрямую.
+# Для шлюза этого недостаточно — иначе хендлер снова начнёт брать конкретный
+# репозиторий из контейнера. Связывание живёт только в services.api.main.
+name = "Presentation шлюза не знает реализаций"
+type = "forbidden"
+source_modules = ["services.api.presentation"]
+forbidden_modules = ["services.api.infrastructure", "services.api.bootstrap"]
+
+[[tool.importlinter.contracts]]
+name = "Сервисы не импортируют друг друга напрямую — только через HTTP/AMQP"
+type = "independence"
+modules = [
+    "services.api",
+    "services.crawler",
+    "services.docs_worker",
+    "services.llm_service",
+    "services.embedding_service",
+    "services.recsys_service",
+    "services.research",
+]
+
+[[tool.importlinter.contracts]]
+name = "libs.shared не знает о сервисах"
+type = "forbidden"
+source_modules = ["libs.shared"]
+forbidden_modules = ["services"]

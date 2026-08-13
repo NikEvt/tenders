@@ -1,0 +1,8 @@
+# Контекст сборки веб-образа: без этого в демон уезжают node_modules и .next.
+node_modules/
+.next/
+out/
+coverage/
+.env
+.env.local
+*.log

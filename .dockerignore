@@ -1,0 +1,18 @@
+# Контекст сборки: без этого в демон уезжают venv, legacy и модели —
+# сотни мегабайт на каждый билд.
+.venv/
+venv/
+legacy/
+.git/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.import_linter_cache/
+__pycache__/
+*.py[cod]
+tests/
+data/
+models/
+*.bin
+.env
+.env.local

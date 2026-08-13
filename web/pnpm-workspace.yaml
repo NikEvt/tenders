@@ -1,0 +1,12 @@
+packages:
+  - .
+
+# pnpm 11 не запускает install-скрипты зависимостей, пока они не разрешены явно,
+# и в неинтерактивном режиме (CI, docker build) падает с ERR_PNPM_IGNORED_BUILDS.
+# Здесь разрешены ровно те пакеты, которым сборка действительно нужна:
+# esbuild и unrs-resolver — бинарники для vitest и резолвера eslint,
+# sharp — оптимизация изображений в Next.
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

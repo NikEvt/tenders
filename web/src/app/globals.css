@@ -1,0 +1,432 @@
+@import "tailwindcss";
+@import "./fonts.css";
+
+/* Тёмная тема ставится next-themes через data-theme на <html>. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ---------------------------------------------------------------- палитра
+   Сырой ряд. Никогда не переопределяется темой и никогда не доходит до
+   компонентов: `--palette-*` не входит ни в один namespace Tailwind, поэтому
+   класса `bg-palette-blue-600` не существует в принципе. Здесь же и причина,
+   по которой палитра лежит в обычном `:root`, а не в `@theme` — ей не нужны
+   утилиты, нужна только доступность из `var()`. */
+:root {
+  --palette-blue-200: #b9cffb;
+  --palette-blue-300: #8fb2f7;
+  --palette-blue-500: #3b6fe8;
+  --palette-blue-600: #0d4cd3;
+  --palette-blue-700: #0a3ca8;
+
+  --palette-oak-300: #e8bd72;
+  --palette-oak-500: #b5751a;
+  --palette-oak-700: #7a4d0d;
+
+  --palette-moss-300: #7fd4a9;
+  --palette-moss-500: #2e7355;
+  --palette-moss-700: #1d4f3a;
+
+  --palette-signal-300: #f2909a;
+  --palette-signal-500: #c62031;
+  --palette-signal-700: #9b1f2c;
+
+  --palette-n-0: #ffffff;
+  --palette-n-25: #fafaf8;
+  --palette-n-50: #f2f3f0;
+  --palette-n-100: #e7e9e4;
+  --palette-n-200: #d2d6ce;
+  --palette-n-400: #6f766e;
+  --palette-n-600: #5a615a;
+  --palette-n-900: #12151a;
+}
+
+/* ------------------------------------------------- семантика и пары цветов
+   Блок намеренно НЕ `inline`. При `@theme inline` Tailwind подставляет
+   значение токена прямо в утилиту (`bg-canvas` → `var(--palette-n-50)`), и
+   переопределение `--color-canvas` в тёмной теме до утилиты уже не доходит —
+   это и есть механика, из-за которой тёмная тема ехала чёрным по чёрному.
+   Без `inline` утилита ссылается на сам токен, и тема работает. */
+@theme {
+  /* поверхности и текст */
+  --color-canvas: var(--palette-n-50);
+  --color-surface: var(--palette-n-0);
+  --color-surface-raised: var(--palette-n-0);
+  --color-surface-sunken: var(--palette-n-25);
+  --color-hairline: var(--palette-n-100);
+  --color-border-strong: var(--palette-n-200);
+  --color-text: var(--palette-n-900);
+  --color-text-muted: var(--palette-n-600);
+  /* Самая светлая ступень текста. Роль нетекстовая: значки, разделители,
+     placeholder, выключенные состояния — планка 3:1, см. docs/DESIGN.md §2.
+     Прежнее `#8D948B` не держало и её (2.9:1 на белом). */
+  --color-text-subtle: var(--palette-n-400);
+  /* Затемнение под модальным окном. Фон без текста, поэтому пары не требует,
+     но темой управляется: в тёмной теме 25% чернил не отделяют окно от холста. */
+  --color-scrim: rgb(18 21 26 / 0.25);
+  --color-row-active: #eaf0fc; /* on-row-active 15.2:1 */
+  --color-on-row-active: #12151a;
+
+  /* пары «фон + его единственный законный текст».
+     Ratio проверяется тестом src/shared/ui/__tests__/contrast.test.ts, а не
+     доверием к комментарию: цифры рядом — для чтения, тест — для правды. */
+  --color-gos-bg: var(--palette-blue-600); /* on-gos 7.0:1 */
+  --color-on-gos: #ffffff;
+  --color-gos-bg-press: var(--palette-blue-700);
+  --color-signal-bg: var(--palette-signal-500); /* on-signal 5.8:1 */
+  --color-on-signal: #ffffff;
+
+  --color-gos-tint: #e8eefc;
+  --color-on-gos-tint: var(--palette-blue-700); /* 8.1:1 — не --color-text */
+  --color-oak-tint: #f7eedd;
+  --color-on-oak-tint: var(--palette-oak-700); /* 6.3:1 */
+  --color-moss-tint: #e5f0ea;
+  --color-on-moss-tint: var(--palette-moss-700); /* 8.1:1 */
+  --color-signal-tint: #fbe9ea;
+  --color-on-signal-tint: var(--palette-signal-700); /* 6.8:1 */
+  --color-vellum: #fbf7ef;
+  --color-vellum-edge: #e9dfc9;
+  --color-on-vellum: #2a2419; /* 14.4:1 */
+
+  /* цвет КАК ТЕКСТ на холсте — другой токен, чем тот же цвет как фон.
+     Тот же токен служит и цветом рисунка: узлы шкалы, заливка столбца,
+     дубовый кант веллума. Нетекстовому знаку хватает 3:1, тексту — 4.5:1;
+     один токен, взятый по строгой планке, закрывает оба случая. */
+  --color-gos-fg: var(--palette-blue-600); /* 6.3:1 на холсте */
+  --color-oak-fg: var(--palette-oak-700); /* 6.5:1 на холсте */
+  --color-moss-fg: var(--palette-moss-700); /* 8.5:1 */
+  --color-signal-fg: var(--palette-signal-700); /* 7.2:1 */
+}
+
+@theme inline {
+  /* типографика */
+  --font-sans: "Golos Text", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  --text-display: 2.125rem;
+  --text-display--line-height: 2.5rem;
+  --text-display--letter-spacing: -0.02em;
+  --text-display--font-weight: 600;
+  --text-h1: 1.625rem;
+  --text-h1--line-height: 2rem;
+  --text-h1--letter-spacing: -0.015em;
+  --text-h1--font-weight: 600;
+  --text-h2: 1.25rem;
+  --text-h2--line-height: 1.75rem;
+  --text-h2--letter-spacing: -0.01em;
+  --text-h2--font-weight: 600;
+  --text-h3: 1rem;
+  --text-h3--line-height: 1.5rem;
+  --text-h3--font-weight: 600;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.375rem;
+  --text-body-sm: 0.8125rem;
+  --text-body-sm--line-height: 1.25rem;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1rem;
+  --text-caption--letter-spacing: 0.02em;
+  --text-caption--font-weight: 500;
+  --text-mono: 0.8125rem;
+  --text-mono--line-height: 1.25rem;
+  --text-eyebrow: 0.6875rem;
+  --text-eyebrow--line-height: 1rem;
+  --text-eyebrow--letter-spacing: 0.06em;
+  --text-eyebrow--font-weight: 500;
+
+  /* форма и глубина */
+  --radius-input: 6px;
+  --radius-card: 10px;
+  --radius-overlay: 14px;
+  --shadow-raise:
+    0 1px 2px rgb(18 21 26 / 0.04), 0 4px 12px rgb(18 21 26 / 0.06);
+  --shadow-overlay: 0 12px 32px rgb(18 21 26 / 0.12);
+
+  /* движение */
+  --ease-enter: cubic-bezier(0.2, 0, 0, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --dur-state: 120ms;
+  --dur-move: 180ms;
+  --dur-panel: 240ms;
+
+  /* каркас */
+  --spacing-rail: 248px;
+  --spacing-rail-collapsed: 64px;
+  --spacing-inspector: 480px;
+  --spacing-topbar: 56px;
+}
+
+/* Тёмная тема — не инверсия: холст уходит в сине-чёрный, `gos` светлеет ради
+   контраста, `vellum` остаётся «бумагой», только тёмной, с oak-кантом.
+   Переопределяются только семантические токены и пары — палитра остаётся
+   собой, иначе `--palette-blue-600` перестал бы быть значением цвета и стал
+   бы ролью. Каждая пара переезжает целиком: фон без своего текста здесь
+   поменять нельзя. */
+[data-theme="dark"] {
+  --color-canvas: #14161a;
+  --color-surface: #1b1e23;
+  --color-surface-raised: #22262c;
+  --color-surface-sunken: #1f2228;
+  --color-hairline: #282c32;
+  --color-border-strong: #363b42;
+  --color-text: #e8eae6;
+  --color-text-muted: #a0a69e;
+  --color-text-subtle: #8b928a;
+  --color-scrim: rgb(0 0 0 / 0.6);
+  --color-row-active: #212b3c;
+  --color-on-row-active: #e8eae6;
+
+  /* Инстинкт — высветлить акцент; прежний `#5B8DEF` так и делал и давал
+     3.2:1 под белым текстом: светло для белого, темно для чёрного.
+     `#3B6FE8` держит белый читаемым в обеих темах, поэтому логика цвета
+     текста на главной кнопке не ветвится по теме. Вверх не «улучшать». */
+  --color-gos-bg: var(--palette-blue-500); /* on-gos 4.5:1 */
+  --color-on-gos: #ffffff; /* пара держится в обеих темах */
+  --color-gos-bg-press: #2f5cc9;
+  --color-signal-bg: #b81d2d; /* on-signal 6.5:1 */
+  --color-on-signal: #ffffff;
+
+  --color-gos-tint: #17243d;
+  --color-on-gos-tint: var(--palette-blue-200); /* было чёрным по тёмно-синему */
+  --color-oak-tint: #2b2113;
+  --color-on-oak-tint: var(--palette-oak-300);
+  --color-moss-tint: #14261e;
+  --color-on-moss-tint: var(--palette-moss-300);
+  --color-signal-tint: #2b1518;
+  --color-on-signal-tint: var(--palette-signal-300);
+  --color-vellum: #221e17;
+  --color-vellum-edge: #3a3123;
+  --color-on-vellum: #ded6c6;
+
+  --color-gos-fg: var(--palette-blue-300); /* ссылки на холсте */
+  --color-oak-fg: var(--palette-oak-300);
+  --color-moss-fg: var(--palette-moss-300);
+  --color-signal-fg: var(--palette-signal-300);
+
+  --shadow-raise: 0 1px 2px rgb(0 0 0 / 0.3), 0 4px 12px rgb(0 0 0 / 0.35);
+  --shadow-overlay: 0 12px 32px rgb(0 0 0 / 0.5);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    color-scheme: light;
+  }
+
+  html[data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+    font-feature-settings: "ss01";
+  }
+
+  /* Кольцо фокуса берёт «синий как рисунок», а не «синий как подложка»:
+     на тонированной строке фон уже синий, и кольцо цвета фона исчезло бы. */
+  :focus-visible {
+    outline: 2px solid var(--color-gos-fg);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Внутри парной подложки кольцо переключается на её текст — иначе синее
+     кольцо на синей плашке пропадает. */
+  .surface-gos :focus-visible,
+  .surface-gos-tint :focus-visible {
+    outline-color: currentcolor;
+  }
+
+  /* Идентификаторы и деньги не должны переливаться между строками. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Выделение — тоже цветной фон, и пара к нему обязательна: без неё в тёмной
+     теме выделенный текст оставался светлым на светло-синем. */
+  ::selection {
+    background: var(--color-gos-tint);
+    color: var(--color-on-gos-tint);
+  }
+}
+
+/* ----------------------------------------------------------- парные подложки
+   Единственный способ взять цветной фон. Утилита ставит фон и его текст одним
+   объявлением, поэтому «фон без пары» — не ошибка дисциплины, а несуществующая
+   запись: написать `bg-gos-tint` без `text-on-gos-tint` больше нельзя, такого
+   класса просто нет (см. правило в eslint.config.mjs).
+
+   Объявлены через `@utility`, а не классом в `@layer utilities`, чтобы
+   работали варианты: строке списка нужен `data-[selected=true]:surface-gos-tint`,
+   а классу из `@layer` Tailwind вариантов не генерирует. */
+@utility surface-gos {
+  background-color: var(--color-gos-bg);
+  color: var(--color-on-gos);
+
+  /* Нажатие меняет фон, но не трогает `--color-on-gos`: пара обязана
+     пережить и hover, иначе она держится только в покое. */
+  &:hover,
+  &:active {
+    background-color: var(--color-gos-bg-press);
+  }
+}
+
+@utility surface-signal {
+  background-color: var(--color-signal-bg);
+  color: var(--color-on-signal);
+}
+
+@utility surface-gos-tint {
+  background-color: var(--color-gos-tint);
+  color: var(--color-on-gos-tint);
+}
+
+@utility surface-oak-tint {
+  background-color: var(--color-oak-tint);
+  color: var(--color-on-oak-tint);
+}
+
+@utility surface-moss-tint {
+  background-color: var(--color-moss-tint);
+  color: var(--color-on-moss-tint);
+}
+
+@utility surface-signal-tint {
+  background-color: var(--color-signal-tint);
+  color: var(--color-on-signal-tint);
+}
+
+@utility surface-vellum {
+  background-color: var(--color-vellum);
+  color: var(--color-on-vellum);
+}
+
+/* Выбранная и открытая строка списка. Подсветка, а не тонированная плашка:
+   текст на ней остаётся обычным текстом — но пара всё равно объявлена явно,
+   иначе «обычный текст» пришлось бы каждый раз доказывать заново. */
+@utility surface-row-active {
+  background-color: var(--color-row-active);
+  color: var(--color-on-row-active);
+}
+
+@layer utilities {
+  .clamp-1 {
+    display: -webkit-box;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* Длинный текст читается колонкой, а не во всю ширину монитора. */
+  .measure {
+    max-width: 68ch;
+  }
+}
+
+/* Единственная оркестрованная анимация в приложении — раскрытие сводки дня,
+   один раз за календарный день (см. widgets/digest-reader). */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise-in {
+  animation: rise-in var(--dur-move) var(--ease-enter) both;
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--color-hairline);
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(255 255 255 / 0.35),
+    transparent
+  );
+  animation: shimmer 1.4s infinite;
+}
+
+[data-theme="dark"] .skeleton::after {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(255 255 255 / 0.06),
+    transparent
+  );
+}
+
+/* Единственная фоновая анимация в приложении: при наведении на любую шкалу
+   сроков все видимые шкалы одновременно проявляют вертикаль сегодняшнего дня —
+   строки списка выравниваются по одной линии «сейчас». Больше нигде ничего
+   само по себе не двигается. */
+.rail-nowline {
+  opacity: 0;
+  transition: opacity 160ms var(--ease-enter);
+}
+
+body:has(.rail:hover) .rail-nowline {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body:has(.rail:hover) .rail-nowline {
+    opacity: 0;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+
+  body {
+    background: #fff;
+    color: #000;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

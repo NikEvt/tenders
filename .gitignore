@@ -1,0 +1,37 @@
+# Секреты — никогда в репозиторий
+.env
+.env.local
+*.pem
+*.key
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Данные и артефакты
+data/*.xml
+data/*.zip
+data/documents_list.txt
+models/
+*.log
+
+# Крупные бинарники установщика сертификатов (не нужны для сборки)
+AutoWorkInstaller-*.bin
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Старый код до рефакторинга — не участвует в сборке
+legacy/
+.import_linter_cache/
+node_modules

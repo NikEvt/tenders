@@ -1,0 +1,12 @@
+# Образ для scripts/market_analysis.py.
+#
+# Базовый docs-образ уже несёт всё дорогое: tesseract с русским языком,
+# LibreOffice для устаревших .doc/.xls и корневые сертификаты Минцифры, без
+# которых не проходит TLS-рукопожатие с ЕИС. Не хватает только xmltodict —
+# он в extras краулера, а не docs.
+#
+# Сборка:
+#   docker build -t zakupki-market-analysis -f docker/Dockerfile.analysis .
+# (сначала должен быть собран базовый образ: docker compose build docs-worker)
+FROM zakupki-docs-worker:latest
+RUN pip install --no-cache-dir xmltodict
