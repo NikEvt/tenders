@@ -25,7 +25,11 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from libs.shared.logging import get_logger
-from services.crawler.application.ports import CrawlRunLogPort, CrawlRunnerPort
+from services.crawler.application.ports import (
+    CrawlProgressPort,
+    CrawlRunLogPort,
+    CrawlRunnerPort,
+)
 from services.crawler.domain.models import CrawlRequest, CrawlResult
 
 log = get_logger(__name__)
@@ -64,11 +68,13 @@ class CrawlPeriodUseCase:
         run_log: CrawlRunLogPort,
         document_types: Sequence[str],
         workers: int = 1,
+        progress: CrawlProgressPort | None = None,
     ) -> None:
         self._runner = runner
         self._run_log = run_log
         self._document_types = list(document_types)
         self._workers = max(int(workers), 1)
+        self._progress = progress
 
     async def execute(
         self,
@@ -121,10 +127,19 @@ class CrawlPeriodUseCase:
         # Потолок одновременных обращений к ЕИС. Больше шести он не выдерживает,
         # а бан прилетает на весь прогон, а не на одну выгрузку.
         limit = asyncio.Semaphore(self._workers)
+        finished = 0
+        await self._report(0, outcome.requested)
 
         async def run_one(request: CrawlRequest) -> CrawlResult:
+            nonlocal finished
             async with limit:
-                return await self._runner.run(request)
+                try:
+                    return await self._runner.run(request)
+                finally:
+                    # В `finally`, а не после: упавшая выгрузка тоже пройдена,
+                    # и полоса не должна застревать на ней.
+                    finished += 1
+                    await self._report(finished, outcome.requested)
 
         results = await asyncio.gather(
             *(run_one(request) for request in pending), return_exceptions=True
@@ -156,3 +171,12 @@ class CrawlPeriodUseCase:
             failed=outcome.failed,
         )
         return outcome
+
+    async def _report(self, processed: int, total: int) -> None:
+        """Докладывает о ходе. Отчёт — вспомогательное: ронять из-за него выгрузку нельзя."""
+        if self._progress is None:
+            return
+        try:
+            await self._progress.report(processed, total)
+        except Exception as exc:
+            log.warning("crawl_period.progress_failed", error=str(exc))

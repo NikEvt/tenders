@@ -11,6 +11,7 @@ from datetime import date
 from services.api.application.errors import InvalidRequest, NotFound
 from services.api.application.ports.digest import DigestReadPort
 from services.api.application.ports.jobs import JobReadPort
+from services.api.domain.jobs import JobView
 
 
 class GetDigestUseCase:
@@ -43,7 +44,7 @@ class GetJobUseCase:
     def __init__(self, jobs: JobReadPort) -> None:
         self._jobs = jobs
 
-    async def execute(self, job_id: str) -> dict:
+    async def execute(self, job_id: str) -> JobView:
         job = await self._jobs.get(job_id)
         if job is None:
             raise NotFound(f"Задание {job_id} не найдено", job_id=job_id)

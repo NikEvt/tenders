@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -17,11 +18,12 @@ from libs.shared.config import (
     llm_settings,
     rabbit_settings,
 )
-from libs.shared.contracts.criteria_spec import CriteriaSpec
+from libs.shared.contracts.criteria_spec import CriteriaSpec, StrictSchema
 from libs.shared.contracts.events import DigestRequested, Event, ResearchRequested
 from libs.shared.logging import configure_logging, get_logger, set_correlation_id
 from libs.shared.messaging.consumer import EventConsumer
 from libs.shared.messaging.topology import QueueSpec
+from libs.shared.regions import is_known_region, normalize_region_code
 from services.llm_service.application.ports import LlmUnavailable
 from services.llm_service.application.use_cases.generate_digest import digest_date_for
 from services.llm_service.bootstrap import LlmContainer, build_container
@@ -37,8 +39,13 @@ QUEUE = QueueSpec(
     prefetch=2,
 )
 
-# Сводка за вчера формируется утром.
+#: Во сколько по Москве идёт утренняя сборка.
+#:
+#: Час именно московский, и таймзона указана явно: `datetime.now()` в
+#: контейнере отдаёт UTC, поэтому «7» без зоны означал 10:00 MSK, а имя
+#: константы утверждало обратное.
 DIGEST_HOUR_MSK = 7
+MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 class CompileRequest(BaseModel):
@@ -77,8 +84,17 @@ class SaveFilterResponse(BaseModel):
 
 
 class RunFilterRequest(BaseModel):
+    """Что именно прогонять: критерий уже задан путём, здесь — охват.
+
+    `tender_ids` отсюда убран. Он принимался, валидировался, пересылался через
+    границу сервиса — и не читался никогда: в `ResearchRequested` поля под него
+    нет. Параметр, который молча ничего не делает, хуже отсутствующего: рано
+    или поздно им пользуются добросовестно.
+    """
+
     since: date | None = None
-    tender_ids: list[int] = Field(default_factory=list)
+    until: date | None = None
+    regions: list[str] = Field(default_factory=list)
 
 
 class JobAccepted(BaseModel):
@@ -205,10 +221,27 @@ async def test_filter(filter_id: int, request: TestFilterRequest) -> JobAccepted
 
 @app.post("/filters/{filter_id}/run", response_model=JobAccepted, status_code=202)
 async def run_filter(filter_id: int, request: RunFilterRequest) -> JobAccepted:
-    """Запускает фильтрацию асинхронно: прогон по сотням тендеров занимает минуты."""
+    """Запускает исследование асинхронно: прогон по сотням тендеров занимает минуты.
+
+    Регионы и сроки задаются здесь и **перекрывают** структурные условия
+    критерия: человек выбрал охват явно, и молча его расширять нельзя — иначе
+    знаменатель воронки перестанет соответствовать запросу.
+    """
     current = container()
     if await current.filters.get_spec(filter_id) is None:
         raise HTTPException(status_code=404, detail=f"Фильтр {filter_id} не найден")
+
+    if request.since and request.until and request.until < request.since:
+        raise HTTPException(status_code=422, detail="Конец периода раньше начала")
+
+    # Опечатка в коде региона иначе дала бы прогон, который ничего не прочитал,
+    # ничего не нашёл и отчитался чистой воронкой нулей — ложноотрицательный
+    # результат в обличье настоящего.
+    unknown = [code for code in request.regions if not is_known_region(code)]
+    if unknown:
+        raise HTTPException(
+            status_code=422, detail=f"Неизвестные коды регионов: {', '.join(unknown)}"
+        )
 
     job_id = uuid.uuid4()
     # Задание идёт через ту же очередь, что и события: ретраи, dead-letter
@@ -218,13 +251,15 @@ async def run_filter(filter_id: int, request: RunFilterRequest) -> JobAccepted:
         ResearchRequested(
             filter_id=filter_id,
             job_id=job_id,
+            regions=[normalize_region_code(code) or code for code in request.regions],
             since=request.since,
+            until=request.until,
         ),
     )
     return JobAccepted(job_id=str(job_id))
 
 
-class _JudgeEvidence(BaseModel):
+class _JudgeEvidence(StrictSchema):
     """Ссылка на цитату, которую показывали модели.
 
     Номер, а не свободный текст: только по нему вызывающий может сверить ответ
@@ -236,7 +271,7 @@ class _JudgeEvidence(BaseModel):
     quote: str = ""
 
 
-class _JudgeVerdict(BaseModel):
+class _JudgeVerdict(StrictSchema):
     """Схема структурного ответа судьи."""
 
     match: bool
@@ -316,10 +351,23 @@ async def ready() -> dict[str, str]:
 
 
 async def _daily_digest_loop(current: LlmContainer) -> None:
-    """Просыпается раз в сутки и просит сводку за вчера.
+    """Держит сводку в актуальном состоянии.
 
     Расписание внутри сервиса, а не во внешнем cron: так оно едет вместе с кодом
     и не разъезжается с версией промпта.
+
+    Три свойства, каждое куплено отдельным дефектом.
+
+    **Просит две сводки, а не одну.** За сегодня — черновик, он пересобирается
+    и догоняет доезжающие данные. За вчера — финальную: день закончился, и её
+    можно закрывать. Раньше просилась только вчерашняя, а главная страница
+    спрашивала сегодняшнюю, которой не существовало никогда.
+
+    **Работает сразу при старте, а не после первого сна.** Прежний цикл спал
+    первым делом, поэтому рестарт после часа сборки означал день без сводки
+    вовсе — в базе так и осталось три пустых дня подряд.
+
+    **Час считается по Москве.** `datetime.now()` в контейнере — UTC.
     """
     from libs.shared.messaging.publisher import RabbitPublisher
 
@@ -327,18 +375,38 @@ async def _daily_digest_loop(current: LlmContainer) -> None:
     await publisher.setup()
 
     while True:
+        await _request_digests(publisher)
         await asyncio.sleep(_seconds_until_next_run())
+
+
+async def _request_digests(publisher) -> None:
+    """Черновик за сегодня и финальная за вчера.
+
+    Порядок важен ровно настолько, насколько важна очерёдность на экране:
+    сначала то, что пользователь откроет утром.
+    """
+    today = _moscow_today()
+    for digest_date in (today, digest_date_for(today)):
         try:
             set_correlation_id()
-            await publisher.publish(DigestRequested(digest_date=digest_date_for(date.today())))
-            log.info("digest.scheduled")
+            await publisher.publish(DigestRequested(digest_date=digest_date))
+            log.info("digest.scheduled", digest_date=digest_date.isoformat())
         except Exception as exc:
-            log.error("digest.schedule_failed", error=str(exc))
+            # Отказ по одной дате не должен уносить вторую.
+            log.error(
+                "digest.schedule_failed",
+                digest_date=digest_date.isoformat(),
+                error=str(exc),
+            )
+
+
+def _moscow_today() -> date:
+    return datetime.now(MOSCOW).date()
 
 
 def _seconds_until_next_run() -> float:
-    now = datetime.now()
-    target = datetime.combine(now.date(), time(hour=DIGEST_HOUR_MSK))
+    now = datetime.now(MOSCOW)
+    target = datetime.combine(now.date(), time(hour=DIGEST_HOUR_MSK), tzinfo=MOSCOW)
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()

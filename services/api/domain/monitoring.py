@@ -90,6 +90,9 @@ class PipelineFunnel:
     chunked: int
     embedded: int
     failures: list[tuple[str, int]] = field(default_factory=list)
+    #: Причины отказа политики допуска: том архива, бюджет закупки, размер.
+    #: Объясняют разрыв между «скачано» и «извлечён текст».
+    skip_reasons: list[tuple[str, int]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

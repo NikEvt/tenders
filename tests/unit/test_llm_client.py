@@ -67,6 +67,40 @@ def build(responses: list, **overrides) -> tuple[OpenAiCompatibleLlm, FakeOpenAI
     return OpenAiCompatibleLlm(settings(**overrides), client=fake), fake  # type: ignore[arg-type]
 
 
+class TestTruncatedAnswers:
+    """Оборванный ответ — не «невалидный»: причина другая, и чинится иначе."""
+
+    @pytest.mark.asyncio
+    async def test_truncation_is_named_by_its_cause(self) -> None:
+        """Модель зациклилась в значении и упёрлась в потолок токенов.
+
+        Наблюдалось на шаблоне `газ(?!овый|…|опроводник|опроводник|…`: JSON
+        оборвался на 16607-м символе. Структурный вывод держит форму JSON, но
+        не длину строки внутри него, поэтому грамматика тут не помогает.
+        """
+        truncated = '{"name": "газ", "terms": [{"pattern": "газ(?!опроводник|опров'
+        llm, _ = build([message(content=truncated, finish_reason="length")])
+
+        with pytest.raises(LlmUnavailable) as caught:
+            await llm.complete(system="s", user="u")
+
+        assert "оборван" in str(caught.value)
+        assert "max_tokens" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_a_complete_answer_passes_through(self) -> None:
+        llm, _ = build([message(content='{"ok": true}', finish_reason="stop")])
+
+        assert await llm.complete(system="s", user="u") == '{"ok": true}'
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_finish_reason_is_not_treated_as_truncation(self) -> None:
+        """Провайдеры не обязаны присылать finish_reason — молчание не повод падать."""
+        llm, _ = build([message(content="ответ", finish_reason=None)])
+
+        assert await llm.complete(system="s", user="u") == "ответ"
+
+
 class TestReasoningModels:
     @pytest.mark.asyncio
     async def test_empty_content_with_reasoning_is_not_passed_off_as_answer(self) -> None:

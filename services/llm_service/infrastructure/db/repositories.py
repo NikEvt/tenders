@@ -5,12 +5,20 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import ColumnElement, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from libs.shared.contracts.criteria_spec import CriteriaSpec
-from libs.shared.db.schema import DailyDigest, Job, LlmVerdict, SavedFilter, Tender
+from libs.shared.db.schema import (
+    DailyDigest,
+    Job,
+    LlmVerdict,
+    ResearchVerdict,
+    SavedFilter,
+    Tender,
+)
+from libs.shared.db.tender_criteria import TenderCriteria, predicates
 from libs.shared.logging import get_logger
 from services.llm_service.application.ports import (
     DigestRepositoryPort,
@@ -19,6 +27,7 @@ from services.llm_service.application.ports import (
 )
 from services.llm_service.domain.models import (
     DigestInput,
+    DigestScope,
     FilterPatch,
     SavedFilterView,
     TenderCandidate,
@@ -150,14 +159,6 @@ class SqlFilterRepository(FilterRepositoryPort):
         # Вердикты уходят каскадом: без фильтра они не интерпретируются.
         return bool(result.rowcount)
 
-    async def mark_run(self, filter_id: int) -> None:
-        async with self._session_factory() as session, session.begin():
-            await session.execute(
-                update(SavedFilter)
-                .where(SavedFilter.id == filter_id)
-                .values(last_run_at=func.now())
-            )
-
     async def cached_verdict_tender_ids(
         self, filter_id: int, prompt_version: str
     ) -> set[int]:
@@ -209,21 +210,27 @@ class SqlDigestRepository(DigestRepositoryPort):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def exists(self, digest_date: date) -> bool:
+    async def built_at(self, digest_date: date) -> datetime | None:
         async with self._session_factory() as session:
-            found = await session.scalar(
-                select(DailyDigest.digest_date).where(DailyDigest.digest_date == digest_date)
+            return await session.scalar(
+                select(DailyDigest.generated_at).where(
+                    DailyDigest.digest_date == digest_date
+                )
             )
-        return found is not None
 
     async def collect(self, digest_date: date) -> DigestInput:
         start = datetime.combine(digest_date, time.min)
         end = start + timedelta(days=1)
 
         async with self._session_factory() as session:
+            scope, selected = await self._scope(session)
             published = (
                 Tender.publish_date >= start,
                 Tender.publish_date < end,
+                # Отбор по фильтрам, включённым в сводку. До этого условия
+                # сводка молча брала весь день, а тумблер «включать в сводку»
+                # не был подключён ни к чему.
+                *( [selected] if selected is not None else [] ),
             )
 
             total = await session.scalar(
@@ -270,12 +277,16 @@ class SqlDigestRepository(DigestRepositoryPort):
                         Tender.updated_at < end,
                         Tender.prev_end_date.is_not(None),
                         Tender.prev_end_date != Tender.end_date,
+                        # Сдвиг срока интересен по тем же закупкам, что и
+                        # остальная сводка. Иначе раздел описывал бы весь
+                        # рынок, а соседний — только отобранное.
+                        *([selected] if selected is not None else []),
                     )
                     .limit(DIGEST_TOP_LIMIT)
                 )
             ).all()
 
-            new_customers = await self._new_customers(session, digest_date)
+            new_customers = await self._new_customers(session, digest_date, selected)
 
         candidates = [_to_candidate(row) for row in rows]
         clusters: dict[str, list[TenderCandidate]] = {}
@@ -292,9 +303,74 @@ class SqlDigestRepository(DigestRepositoryPort):
             clusters=clusters,
             deadline_changes=[_to_candidate(row) for row in changed],
             new_customers=new_customers,
+            scope=scope,
         )
 
-    async def _new_customers(self, session: AsyncSession, digest_date: date) -> list[str]:
+    async def _scope(
+        self, session: AsyncSession
+    ) -> tuple[DigestScope, ColumnElement[bool] | None]:
+        """Какие фильтры включены в сводку — и условие отбора по ним.
+
+        Условие собирается **тем же** `predicates`, что и каталог: правило
+        «какие закупки прошли сохранённый фильтр» живёт в одном месте
+        (`libs/shared/db/tender_criteria.py`), и второй его реализации здесь
+        быть не должно. Однажды такая уже завелась и разошлась с первой.
+
+        Фильтров может быть несколько, поэтому условия объединяются `OR`:
+        сводка — это объединение того, что интересно, а не пересечение.
+
+        Возвращает `None` вместо условия, когда включённых фильтров нет: тогда
+        сводка честно описывает весь день, и это её область отбора.
+        """
+        rows = (
+            await session.execute(
+                select(SavedFilter.id, SavedFilter.name, SavedFilter.spec).where(
+                    SavedFilter.is_active.is_(True),
+                    SavedFilter.in_digest.is_(True),
+                )
+            )
+        ).all()
+        if not rows:
+            return DigestScope(), None
+
+        # Фильтр без прогонов вердиктов не имеет и не принесёт ни одной
+        # закупки. Молчать об этом нельзя: пустая сводка выглядела бы выводом
+        # о рынке, хотя это несделанная работа.
+        versions = {
+            row.id: (row.spec or {}).get("version") for row in rows
+        }
+        judged = set(
+            (
+                await session.scalars(
+                    select(func.distinct(ResearchVerdict.criteria_version)).where(
+                        ResearchVerdict.criteria_version.in_(
+                            [v for v in versions.values() if v]
+                        )
+                    )
+                )
+            ).all()
+        )
+
+        scope = DigestScope(
+            filters=[row.name for row in rows],
+            unrun_filters=[
+                row.name for row in rows if versions.get(row.id) not in judged
+            ],
+        )
+        condition = or_(
+            *(
+                predicates(TenderCriteria(filter_id=row.id))["filter_id"]
+                for row in rows
+            )
+        )
+        return scope, condition
+
+    async def _new_customers(
+        self,
+        session: AsyncSession,
+        digest_date: date,
+        selected: ColumnElement[bool] | None,
+    ) -> list[str]:
         start = datetime.combine(digest_date, time.min)
         end = start + timedelta(days=1)
         lookback = start - timedelta(days=NEW_CUSTOMER_LOOKBACK_DAYS)
@@ -311,6 +387,10 @@ class SqlDigestRepository(DigestRepositoryPort):
                     Tender.publish_date < end,
                     Tender.customer_inn.is_not(None),
                     Tender.customer_inn.notin_(seen_before),
+                    # «Новый» — в пределах области отбора: заказчик, впервые
+                    # появившийся с интересной закупкой, и заказчик, впервые
+                    # появившийся вообще, — разные новости.
+                    *([selected] if selected is not None else []),
                 )
             )
         ).all()
@@ -355,16 +435,24 @@ class SqlJobTracker(JobTrackerPort):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def start(self, job_id: str, kind: str, total: int) -> None:
+    async def start(
+        self, job_id: str, kind: str, total: int, phase: str | None = None
+    ) -> None:
         async with self._session_factory() as session, session.begin():
             statement = pg_insert(Job).values(
-                id=job_id, kind=kind, status="running", total=total, processed=0
+                id=job_id,
+                kind=kind,
+                status="running",
+                phase=phase,
+                total=total,
+                processed=0,
             )
             await session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[Job.id],
                     set_={
                         "status": "running",
+                        "phase": phase,
                         "total": total,
                         "processed": 0,
                         "updated_at": func.now(),
@@ -381,22 +469,20 @@ class SqlJobTracker(JobTrackerPort):
             )
 
     async def finish(self, job_id: str, result: dict) -> None:
+        # `processed` не трогаем: он уже доведён до `total` ходом операции.
+        # Раньше здесь стояло `result.get("evaluated_by_llm", 0)` — наследие
+        # удалённого движка фильтров, обнулявшее полосу в момент завершения.
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 update(Job)
                 .where(Job.id == job_id)
-                .values(
-                    status="done",
-                    result=result,
-                    processed=result.get("evaluated_by_llm", 0),
-                    updated_at=func.now(),
-                )
+                .values(status="done", result=result, updated_at=func.now())
             )
 
     async def fail(self, job_id: str, error: str) -> None:
         async with self._session_factory() as session, session.begin():
             statement = pg_insert(Job).values(
-                id=job_id, kind="filter_evaluate", status="failed", error_message=error[:2000]
+                id=job_id, kind="digest", status="failed", error_message=error[:2000]
             )
             await session.execute(
                 statement.on_conflict_do_update(

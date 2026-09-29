@@ -12,7 +12,7 @@ export const SHORTCUTS: { keys: string; action: string }[] = [
   { keys: "h", action: ru.keyboard.hideRow },
   { keys: "s", action: ru.keyboard.similarRow },
   { keys: "1…5", action: ru.keyboard.switchTabs },
-  { keys: "g d / g c / g f / g r / g m", action: ru.keyboard.goto },
+  { keys: "g d / g c / g f / g r / g n / g m", action: ru.keyboard.goto },
   { keys: "Esc", action: ru.keyboard.escape },
   { keys: "?", action: ru.keyboard.sheet },
 ];

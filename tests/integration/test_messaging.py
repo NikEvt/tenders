@@ -18,9 +18,17 @@ from libs.shared.messaging.outbox import OutboxPublisher, OutboxRelay, SqlIdempo
 from libs.shared.messaging.publisher import RabbitPublisher
 from libs.shared.messaging.topology import QueueSpec, connect
 
-# Ретрай-лестница начинается с 5 секунд — ждём чуть дольше первого уровня.
-FIRST_RETRY_WAIT = 9.0
+#: Короткая лестница повторов на время теста. Проверять надо, что повтор
+#: случился и в нужном порядке, а не что RabbitMQ умеет ждать пять секунд:
+#: настоящая лестница (5с → 30с → …) стоила трём тестам 20 секунд из 36.
+TEST_RETRY_DELAYS_MS = (200, 400, 800, 1_600, 3_200)
+
+#: Ждём заметно дольше первого уровня — с запасом на доставку через брокер.
+FIRST_RETRY_WAIT = 5.0
 DELIVERY_WAIT = 5.0
+
+#: Окно, в котором доказывается, что сообщение НЕ пришло.
+NO_DELIVERY_WINDOW = 1.0
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -36,11 +44,16 @@ async def connection() -> AsyncIterator:
 @pytest_asyncio.fixture
 async def queue_spec(connection) -> AsyncIterator[QueueSpec]:
     """Своя очередь на каждый тест — тесты не мешают друг другу."""
-    spec = QueueSpec(name=f"test.{uuid.uuid4().hex[:8]}", routing_keys=("tender.ingested",))
+    spec = QueueSpec(
+        name=f"test.{uuid.uuid4().hex[:8]}",
+        routing_keys=("tender.ingested",),
+        retry_delays_ms=TEST_RETRY_DELAYS_MS,
+    )
     yield spec
 
     channel = await connection.channel()
-    for name in [spec.name, spec.dead_queue, *(spec.retry_queue(i) for i in range(5))]:
+    retries = (spec.retry_queue(i) for i in range(spec.max_attempts))
+    for name in [spec.name, spec.dead_queue, *retries]:
         queue = await channel.get_queue(name, ensure=False)
         await queue.delete(if_unused=False, if_empty=False)
     await channel.close()
@@ -131,7 +144,8 @@ async def test_permanent_error_goes_straight_to_dead_letter(connection, queue_sp
     )
 
     # Повторов быть не должно: PermanentError минует ретрай-лестницу.
-    await asyncio.sleep(FIRST_RETRY_WAIT)
+    # Ждём дольше первого уровня лестницы — если бы повтор был, он бы уже пришёл.
+    await asyncio.sleep(NO_DELIVERY_WINDOW)
     assert attempts == [13]
     await channel.close()
 
@@ -157,7 +171,9 @@ async def test_duplicate_delivery_is_skipped(connection, queue_spec, session_fac
 
     # То же самое событие (тот же event_id) — брокер гарантирует лишь at-least-once.
     await publisher.publish(event)
-    await asyncio.sleep(2)
+    # Отсутствие доказывается ожиданием, и окно должно быть заметно длиннее
+    # доставки: первая заняла доли секунды, здесь запас на порядок.
+    await asyncio.sleep(NO_DELIVERY_WINDOW)
     assert handled == [99], "дубликат должен быть отброшен по message_id"
 
 

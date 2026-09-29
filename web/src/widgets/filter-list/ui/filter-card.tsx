@@ -10,12 +10,13 @@ import { PageHeader } from "@/shared/ui/section";
 import { TextSkeleton } from "@/shared/ui/skeleton";
 import { endpoints } from "@/shared/api/endpoints";
 import { qk } from "@/shared/api/query-keys";
-import type { Filter, FilterSpec } from "@/shared/api/types";
+import type { Filter, CriteriaSpec } from "@/shared/api/types";
 import { ru } from "@/shared/i18n/ru";
 import { dateLong } from "@/shared/lib/format";
 import { compiledConditions } from "@/features/compile-filter/ui/compiled-chips";
 import { Chip } from "@/shared/ui/chip";
 import { FilterFunnel } from "@/features/test-filter/ui/funnel";
+import { RunResearchForm } from "@/features/run-research/ui/run-research-form";
 
 /** Карточка сохранённого фильтра: что он ищет, когда работал, как проверить. */
 export function FilterCard({ filterId }: { filterId: number }) {
@@ -31,7 +32,7 @@ export function FilterCard({ filterId }: { filterId: number }) {
   if (!filter.data) return null;
 
   const data = filter.data;
-  const spec = data.spec as unknown as FilterSpec;
+  const spec = data.spec as unknown as CriteriaSpec;
   const conditions = compiledConditions(spec);
 
   return (
@@ -47,7 +48,7 @@ export function FilterCard({ filterId }: { filterId: number }) {
       />
 
       <Card className="flex flex-col gap-4">
-        <h2 className="text-h3">{ru.filters.stepStructural}</h2>
+        <h2 className="text-h3">{ru.filters.stepWhat}</h2>
         {conditions.length ? (
           <div className="flex flex-wrap gap-2">
             {conditions.map((condition) => (
@@ -61,11 +62,17 @@ export function FilterCard({ filterId }: { filterId: number }) {
         <DefinitionList
           items={[
             {
-              label: ru.filters.stepSemantic,
-              // Пустое значение — законное состояние: векторного отбора может не быть.
-              value: spec.semantic_query || "—",
+              label: ru.filters.stepTell,
+              // Правил может не быть: тогда всё спорное уйдёт судье. Это
+              // законное состояние, но дорогое — и сказать об этом надо.
+              value: spec.context_rules?.length
+                ? `${spec.context_rules.length}`
+                : "—",
             },
-            { label: ru.filters.stepJudge, value: spec.llm_criteria || "—" },
+            {
+              label: ru.filters.stepWhere,
+              value: spec.card_pattern || "—",
+            },
             {
               label: ru.filters.lastRun,
               value: data.last_run_at ? dateLong(data.last_run_at) : "не запускался",
@@ -85,6 +92,10 @@ export function FilterCard({ filterId }: { filterId: number }) {
       </Card>
 
       <FilterFunnel filterId={data.filter_id} />
+
+      {/* Тест рядом с настоящим прогоном: «работает ли критерий» и «прогнать
+          по этому охвату» — соседние намерения. */}
+      <RunResearchForm filterId={data.filter_id} />
     </div>
   );
 }

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -22,6 +22,14 @@ from services.docs_worker.domain.models import (
 
 log = get_logger(__name__)
 
+#: Чанков в одной вставке.
+#:
+#: Потолок asyncpg — 32767 параметров на запрос, у чанка девять колонок, то
+#: есть предел около 3640 строк. Тысяча оставляет запас на случай, если колонок
+#: станет больше: упереться в него снова значит потерять документ целиком, а не
+#: замедлиться.
+CHUNK_INSERT_BATCH = 1000
+
 # Состояния, из которых документ уже не надо обрабатывать заново.
 TERMINAL_STATUSES = (
     ExtractionStatus.DONE.value,
@@ -32,6 +40,11 @@ TERMINAL_STATUSES = (
 # правилу ни сети, ни диска не стоил, и занимать место в бюджете не должен —
 # иначе двадцать отклонённых томов «съедали» бы квоту техзадания.
 SPENT_STATUSES = (ExtractionStatus.DONE.value,)
+
+
+def _batched(items: list[Chunk], size: int) -> Iterator[list[Chunk]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 class SqlDocumentRepository(DocumentRepositoryPort):
@@ -255,38 +268,46 @@ class SqlDocumentRepository(DocumentRepositoryPort):
             if not chunks:
                 return []
 
-            statement = pg_insert(DocumentChunk).values(
-                [
-                    {
-                        "document_id": ref.document_id,
-                        "tender_id": ref.tender_id,
-                        "chunk_index": chunk.index,
-                        "text": chunk.text,
-                        "char_start": chunk.char_start,
-                        "char_end": chunk.char_end,
-                        "page_from": chunk.page_from,
-                        "page_to": chunk.page_to,
-                        "token_estimate": chunk.token_estimate,
-                    }
-                    for chunk in chunks
-                ]
-            )
-            result = await session.execute(
-                statement.on_conflict_do_update(
-                    constraint="uq_document_chunk",
-                    set_={
-                        "text": statement.excluded.text,
-                        "char_start": statement.excluded.char_start,
-                        "char_end": statement.excluded.char_end,
-                        "page_from": statement.excluded.page_from,
-                        "page_to": statement.excluded.page_to,
-                        "token_estimate": statement.excluded.token_estimate,
-                        # Текст изменился — прежний эмбеддинг больше не соответствует.
-                        "embedding": None,
-                    },
-                ).returning(DocumentChunk.id)
-            )
-            return [row[0] for row in result.all()]
+            # Вставка идёт пачками: у asyncpg потолок 32767 параметров на
+            # запрос, а здесь девять колонок на чанк. Крупная смета в xlsx даёт
+            # тысячи чанков и переполняет его — документ падал целиком с
+            # `the number of query arguments cannot exceed 32767`.
+            chunk_ids: list[int] = []
+            for batch in _batched(list(chunks), CHUNK_INSERT_BATCH):
+                statement = pg_insert(DocumentChunk).values(
+                    [
+                        {
+                            "document_id": ref.document_id,
+                            "tender_id": ref.tender_id,
+                            "chunk_index": chunk.index,
+                            "text": chunk.text,
+                            "char_start": chunk.char_start,
+                            "char_end": chunk.char_end,
+                            "page_from": chunk.page_from,
+                            "page_to": chunk.page_to,
+                            "token_estimate": chunk.token_estimate,
+                        }
+                        for chunk in batch
+                    ]
+                )
+                result = await session.execute(
+                    statement.on_conflict_do_update(
+                        constraint="uq_document_chunk",
+                        set_={
+                            "text": statement.excluded.text,
+                            "char_start": statement.excluded.char_start,
+                            "char_end": statement.excluded.char_end,
+                            "page_from": statement.excluded.page_from,
+                            "page_to": statement.excluded.page_to,
+                            "token_estimate": statement.excluded.token_estimate,
+                            # Текст изменился — прежний эмбеддинг не соответствует.
+                            "embedding": None,
+                        },
+                    ).returning(DocumentChunk.id)
+                )
+                chunk_ids.extend(row[0] for row in result.all())
+
+            return chunk_ids
 
     async def add_embedded_document(self, parent: DocumentRef, file_name: str) -> DocumentRef:
         # Идентификатор вложенного файла выводим из родительского, чтобы повторная

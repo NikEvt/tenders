@@ -252,14 +252,32 @@ def _extract_content(response: object) -> str | None:
     `reasoning_content`, а `content` приходит пустым. Молча вернуть пустую
     строку нельзя: вызывающий код примет её за валидный ответ модели.
     """
-    message = response.choices[0].message  # type: ignore[attr-defined]
+    choice = response.choices[0]  # type: ignore[attr-defined]
+    message = choice.message
     content = getattr(message, "content", None)
+    finish_reason = getattr(choice, "finish_reason", None)
+
     if content:
+        # Оборванный ответ — не «невалидный»: структурный вывод держит форму
+        # JSON, но не длину строки внутри него, и модель умеет зациклиться
+        # прямо в значении. Наблюдалось на шаблоне: `газ(?!овый|…|опроводник`
+        # повторялся, пока не кончился бюджет, и JSON оборвался на середине
+        # строки. Сказать «модель ответила ерундой» здесь значило бы соврать
+        # про причину и увести чинящего не туда.
+        if finish_reason == "length":
+            log.warning(
+                "llm.response_truncated",
+                content_chars=len(content),
+                finish_reason=finish_reason,
+            )
+            raise LlmUnavailable(
+                "Ответ модели оборван: кончился бюджет токенов. "
+                "Увеличьте max_tokens или упростите запрос."
+            )
         return content
 
     reasoning = getattr(message, "reasoning_content", None)
     if reasoning:
-        finish_reason = getattr(response.choices[0], "finish_reason", None)  # type: ignore[attr-defined]
         log.warning(
             "llm.content_empty_reasoning_only",
             reasoning_chars=len(reasoning),

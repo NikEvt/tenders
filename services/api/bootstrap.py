@@ -28,9 +28,12 @@ from libs.shared.config import (
 from libs.shared.config import llm_settings as llm_config
 from libs.shared.contracts.ports import ObjectStoragePort
 from libs.shared.db.base import create_engine, create_session_factory
+from libs.shared.messaging.topology import connect
 from services.api.application.ports import (
     AppStatePort,
+    CorpusStatsPort,
     CrawlerRunReadPort,
+    CrawlPublisherPort,
     DigestReadPort,
     DocumentPipelinePort,
     DocumentReadPort,
@@ -44,6 +47,7 @@ from services.api.application.ports import (
     QueueAdminPort,
     ReadinessPort,
     RecsysServicePort,
+    ResearchReadPort,
     RuntimeSettingsPort,
     ServiceProbePort,
     TenderCatalogPort,
@@ -55,6 +59,7 @@ from services.api.infrastructure.clients.downstream import HttpLlmService, HttpR
 from services.api.infrastructure.clients.rabbit_management import RabbitManagementClient
 from services.api.infrastructure.clients.service_probe import HttpServiceProbe
 from services.api.infrastructure.db.catalog_repository import SqlCatalogRepository
+from services.api.infrastructure.db.corpus_repository import SqlCorpusRepository
 from services.api.infrastructure.db.digest_repository import SqlDigestRepository
 from services.api.infrastructure.db.document_repository import SqlDocumentRepository
 from services.api.infrastructure.db.facets_repository import SqlFacetsRepository
@@ -69,8 +74,10 @@ from services.api.infrastructure.db.monitoring_repository import (
 )
 from services.api.infrastructure.db.profile_repository import SqlProfileHistoryRepository
 from services.api.infrastructure.db.readiness import SqlReadinessProbe
+from services.api.infrastructure.db.research_repository import SqlResearchRepository
 from services.api.infrastructure.db.search_repository import SqlSearchRepository
 from services.api.infrastructure.db.similarity_repository import SqlSimilarityRepository
+from services.api.infrastructure.messaging.crawl_publisher import RabbitCrawlPublisher
 from services.api.infrastructure.settings.env_settings import EnvRuntimeSettings
 from services.api.infrastructure.storage.minio_storage import MinioReadStorage
 
@@ -93,11 +100,14 @@ class ApiContainer:
     queues: QueueAdminPort
     crawler_runs: CrawlerRunReadPort
     pipeline: DocumentPipelinePort
+    corpus: CorpusStatsPort
     events: EventTrailPort
     app_state: AppStatePort
     profile_history: ProfileHistoryPort
+    research: ResearchReadPort
     runtime_settings: RuntimeSettingsPort
     storage: ObjectStoragePort
+    crawl: CrawlPublisherPort
     llm: LlmServicePort
     recsys: RecsysServicePort
 
@@ -136,6 +146,12 @@ async def build_container(
         rabbit.password.get_secret_value(),
     )
 
+    # Единственное AMQP-соединение шлюза: состояние очередей читается по HTTP
+    # через management-API, но команду краулеру иначе как событием не отдать.
+    connection = await connect(rabbit.dsn)
+    crawl = RabbitCrawlPublisher(connection)
+    await crawl.setup()
+
     container = ApiContainer(
         engine=engine,
         session_factory=session_factory,
@@ -153,13 +169,16 @@ async def build_container(
         queues=queues,
         crawler_runs=SqlCrawlerRunRepository(session_factory),
         pipeline=SqlDocumentPipelineRepository(session_factory),
+        corpus=SqlCorpusRepository(session_factory),
         events=SqlEventTrailRepository(session_factory),
         app_state=SqlAppStateRepository(session_factory),
         profile_history=SqlProfileHistoryRepository(session_factory),
+        research=SqlResearchRepository(session_factory),
         runtime_settings=EnvRuntimeSettings(
             llm_settings or llm_config(), eis or eis_settings(), embedding
         ),
         storage=MinioReadStorage(minio),
+        crawl=crawl,
         llm=llm,
         recsys=recsys,
     )
@@ -176,4 +195,5 @@ async def build_container(
         await embedder.aclose()
         await llm.aclose()
         await recsys.aclose()
+        await connection.close()
         await engine.dispose()

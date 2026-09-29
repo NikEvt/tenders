@@ -230,3 +230,26 @@ export function useFirstVisitToday(key: string): boolean {
 
   return first;
 }
+
+/**
+ * Часы ожидания: сколько миллисекунд прошло с `startedAt`, с шагом в секунду.
+ *
+ * Отдельный хук, потому что ожиданий в интерфейсе два вида — с заданием и без
+ * него, — а подпись «идёт 1 мин 20 с» в обоих обязана идти сама. Опрос
+ * задания идёт раз в пять секунд, и без собственного тика подпись дёргалась бы
+ * пятисекундными скачками, то есть выглядела бы подвисшей ровно там, где
+ * доказывает обратное.
+ *
+ * `running: false` останавливает часы: считать время после завершения незачем.
+ */
+export function useElapsed(startedAt: number | null, running: boolean): number {
+  const [now, setNow] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    if (!running || startedAt === null) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running, startedAt]);
+
+  return startedAt === null ? 0 : Math.max(0, now - startedAt);
+}

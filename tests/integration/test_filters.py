@@ -22,6 +22,7 @@ from services.api.domain.filters import MATCH_HISTORY_DAYS
 from services.api.infrastructure.db.filter_repository import SqlFilterReadRepository
 from services.llm_service.domain.models import FilterPatch
 from services.llm_service.infrastructure.db.repositories import SqlFilterRepository
+from services.research.infrastructure.repositories import SqlCriteriaRepository
 
 PREFIX = "TEST-FILTERS-"
 
@@ -115,10 +116,20 @@ async def test_patch_touches_only_named_fields(writer, reader, cleanup) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_is_marked_and_visible_to_the_reader(writer, reader, cleanup) -> None:
+async def test_run_is_marked_and_visible_to_the_reader(
+    writer, reader, session_factory, cleanup
+) -> None:
+    """Отметку о прогоне ставит движок отбора, а читает её шлюз.
+
+    Отметку когда-то умел ставить llm-service, но не звал никто, и `last_run_at`
+    не заполнялся никогда. Меню фильтров на каталоге показывает по нему
+    «не запускался», поэтому писать обязан тот, кто прогон и выполняет.
+    """
     filter_id = await writer.save_spec(f"{PREFIX}Газ", "поставка газа", spec_of())
 
-    await writer.mark_run(filter_id)
+    assert (await reader.get(filter_id, MATCH_HISTORY_DAYS)).last_run_at is None
+
+    await SqlCriteriaRepository(session_factory).mark_run(filter_id)
     card = await reader.get(filter_id, MATCH_HISTORY_DAYS)
 
     assert card is not None and card.last_run_at is not None

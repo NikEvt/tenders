@@ -89,6 +89,16 @@ x-limits-small: &limits-small
     resources:
       limits: { memory: 256m }
 
+#: Краулеру нужно больше прочих «мелких»: суточный архив региона
+#: распаковывается в память целиком, и обход страны в три потока даёт пик
+#: 633 МиБ (замер 14.08.2026). На 256 МиБ краулер перезапускался посреди обхода,
+#: а потолок по памяти в load_policy схлопывал бы его до одного потока — то есть
+#: отменял бы всю параллельность.
+x-limits-crawler: &limits-crawler
+  deploy:
+    resources:
+      limits: { memory: 1g }
+
 x-limits-tiny: &limits-tiny
   deploy:
     resources:
@@ -212,7 +222,7 @@ services:
       args:
         EXTRAS: crawler
     command: ["python", "-m", "services.crawler"]
-    <<: *limits-small
+    <<: *limits-crawler
     environment:
       <<: [*db-env, *mq-env, *log-env]
       EIS_TOKEN: ${EIS_TOKEN:-}

@@ -36,7 +36,8 @@ class TenderFilter:
     # текста в обе стороны.
     has_text: bool | None = None
     filter_id: int | None = None
-    matched_only: bool = True
+    #: Какие вердикты сохранённого фильтра показывать. Пустой кортеж — все.
+    filter_verdicts: tuple[str, ...] = ("confirmed",)
 
     def normalized_page_size(self, page_size: int) -> int:
         return max(1, min(page_size, MAX_PAGE_SIZE))

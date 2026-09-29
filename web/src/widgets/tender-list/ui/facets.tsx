@@ -7,11 +7,10 @@ import { Checkbox, Field, Input, Label } from "@/shared/ui/field";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip } from "@/shared/ui/tooltip";
 import { ru } from "@/shared/i18n/ru";
-import { REGIONS } from "@/shared/lib/format";
+import { RegionChecklist } from "@/shared/ui/region-checklist";
 import { cn } from "@/shared/lib/cn";
 import { useQuery } from "@tanstack/react-query";
 import { endpoints } from "@/shared/api/endpoints";
-import { formatCount } from "@/shared/lib/format";
 import type { Facets as FacetCounts } from "@/shared/api/types";
 import type { CatalogParams } from "../model/use-catalog-params";
 import { toTenderQuery } from "../model/use-catalog-params";
@@ -33,12 +32,6 @@ function useFacetCounts(params: CatalogParams) {
     staleTime: 60_000,
     queryFn: ({ signal }) => endpoints.tenderFacets(toTenderQuery(params), signal),
   });
-}
-
-/** Счётчик рядом с пунктом фасета. Пока не приехал — места не занимает. */
-function Count({ value }: { value: number | undefined }) {
-  if (value === undefined) return null;
-  return <span className="ml-auto tnum text-caption text-text-subtle">{formatCount(value)}</span>;
 }
 
 export function Facets({ params, onChange, layout }: FacetsProps) {
@@ -138,30 +131,11 @@ function RegionFacet({
 }: Omit<FacetsProps, "layout"> & { counts: Map<string, number> }) {
   return (
     <FacetBlock title={ru.catalog.facets.region}>
-      <ul className="flex max-h-64 flex-col gap-1 overflow-y-auto">
-        {Object.entries(REGIONS).map(([code, name]) => {
-          const checked = params.region.includes(code);
-          return (
-            <li key={code}>
-              <label className="flex cursor-pointer items-center gap-2 rounded-[6px] px-1 py-1 text-body-sm hover:bg-surface-sunken">
-                <Checkbox
-                  checked={checked}
-                  onChange={(event) =>
-                    onChange({
-                      region: event.target.checked
-                        ? [...params.region, code]
-                        : params.region.filter((r) => r !== code),
-                      page: 0,
-                    })
-                  }
-                />
-                {name}
-                <Count value={counts.get(code)} />
-              </label>
-            </li>
-          );
-        })}
-      </ul>
+      <RegionChecklist
+        value={params.region}
+        onChange={(region) => onChange({ region, page: 0 })}
+        counts={counts}
+      />
     </FacetBlock>
   );
 }

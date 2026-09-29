@@ -22,6 +22,14 @@ import type { GroupBucket, Tender } from "@/shared/api/types";
 import { TenderRow } from "@/entities/tender/ui/tender-row";
 import { useRateTender } from "@/features/rate-tender/model/use-rate-tender";
 import { downloadCsv } from "@/features/export-csv/lib/export-csv";
+import {
+  FilterPicker,
+  type FilterVerdict,
+} from "@/features/apply-filter/ui/filter-picker";
+import {
+  filterName,
+  useSavedFilters,
+} from "@/features/apply-filter/model/use-saved-filters";
 import { activeConditions } from "../model/active-conditions";
 import { specToParams } from "../model/spec-to-params";
 import { useRestrictiveCondition } from "../model/use-restrictive-condition";
@@ -100,11 +108,20 @@ export function Catalog() {
     staleTime: STALE.list,
   });
 
+  // Любое изменение условий обнуляет постраничность и прокрутку: страницы,
+  // снятые при разных условиях, склеивать нельзя — в списке появились бы и
+  // повторы, и дыры.
+  //
+  // Ключ производный, а не перечисление параметров руками: перечисление уже
+  // приходилось дописывать при каждом новом условии, и забытая строка даёт
+  // пагинацию от предыдущей выдачи — тихо и незаметно.
+  const { page: _page, ...conditionsOnly } = query;
+  const conditionsKey = JSON.stringify(conditionsOnly);
   React.useEffect(() => {
     setPages(1);
     setFocused(0);
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [params.q, params.region, params.okpd2, params.price_min, params.price_max, params.since, params.until, params.only_active, params.deadline_changed, params.has_text, params.filter_id, params.sort, params.group]);
+  }, [conditionsKey]);
 
   // Порядок приходит из API — на клиенте выдача только фильтруется от скрытых.
   const items = React.useMemo(
@@ -114,7 +131,10 @@ export function Catalog() {
 
   const total = results.data?.total ?? 0;
   const loadedAll = items.length >= total;
-  const conditions = activeConditions(params);
+  const savedFilters = useSavedFilters();
+  const conditions = activeConditions(params, {
+    filterName: filterName(savedFilters.data, params.filter_id),
+  });
 
   const restrictive = useRestrictiveCondition(
     params,
@@ -221,7 +241,20 @@ export function Catalog() {
         <Facets params={params} onChange={setParams} layout="column" />
 
         <div className="flex min-w-0 flex-1 flex-col gap-4">
-          <Facets params={params} onChange={setParams} layout="popovers" />
+          <div className="flex flex-wrap items-center gap-2">
+            <FilterPicker
+              filterId={params.filter_id}
+              verdict={params.filter_verdict as FilterVerdict}
+              onChange={(next) =>
+                setParams({
+                  filter_id: next.filterId,
+                  filter_verdict: next.verdict,
+                  page: 0,
+                })
+              }
+            />
+            <Facets params={params} onChange={setParams} layout="popovers" />
+          </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 flex-wrap items-center gap-2">

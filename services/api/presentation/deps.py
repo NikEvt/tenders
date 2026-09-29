@@ -14,6 +14,7 @@ from fastapi import Depends, Request
 from libs.shared.contracts.ports import ObjectStoragePort
 from services.api.application.errors import ServiceNotReady
 from services.api.application.ports import (
+    CrawlPublisherPort,
     DigestReadPort,
     DocumentReadPort,
     FilterReadPort,
@@ -47,6 +48,10 @@ from services.api.application.use_cases.monitoring import (
     TenderEventsUseCase,
 )
 from services.api.application.use_cases.read_catalog import GetTenderUseCase
+from services.api.application.use_cases.read_corpus import (
+    CorpusOverviewUseCase,
+    CorpusProcessingUseCase,
+)
 from services.api.application.use_cases.read_documents import (
     IssueDownloadLinkUseCase,
     ListDocumentChunksUseCase,
@@ -60,6 +65,12 @@ from services.api.application.use_cases.read_filters import (
 from services.api.application.use_cases.read_profile import (
     ProfileHistoryUseCase,
     ProfileWinsUseCase,
+)
+from services.api.application.use_cases.read_research import (
+    GetResearchMarketUseCase,
+    GetResearchRunUseCase,
+    ListResearchRunsUseCase,
+    ListResearchTendersUseCase,
 )
 from services.api.application.use_cases.read_status import (
     GetDigestUseCase,
@@ -118,6 +129,10 @@ def provide_recsys(ports: PortsDep) -> RecsysServicePort:
     return ports.recsys
 
 
+def provide_crawl(ports: PortsDep) -> CrawlPublisherPort:
+    return ports.crawl
+
+
 CatalogDep = Annotated[TenderCatalogPort, Depends(provide_catalog)]
 SearchDep = Annotated[TenderSearchPort, Depends(provide_search)]
 DocumentsDep = Annotated[DocumentReadPort, Depends(provide_documents)]
@@ -127,6 +142,7 @@ ReadinessDep = Annotated[ReadinessPort, Depends(provide_readiness)]
 StorageDep = Annotated[ObjectStoragePort, Depends(provide_storage)]
 LlmDep = Annotated[LlmServicePort, Depends(provide_llm)]
 RecsysDep = Annotated[RecsysServicePort, Depends(provide_recsys)]
+CrawlDep = Annotated[CrawlPublisherPort, Depends(provide_crawl)]
 
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
@@ -239,6 +255,16 @@ def provide_document_pipeline(ports: PortsDep) -> DocumentPipelineUseCase:
     return DocumentPipelineUseCase(ports.pipeline)
 
 
+def provide_corpus_overview(ports: PortsDep) -> CorpusOverviewUseCase:
+    return CorpusOverviewUseCase(ports.corpus)
+
+
+def provide_corpus_processing(ports: PortsDep) -> CorpusProcessingUseCase:
+    # Три порта, а не один запрос: воронку документов считает мониторинг, а
+    # глубину очереди — брокер. Второго источника тех же чисел здесь нет.
+    return CorpusProcessingUseCase(ports.corpus, ports.pipeline, ports.queues)
+
+
 def provide_tender_events(ports: PortsDep) -> TenderEventsUseCase:
     return TenderEventsUseCase(ports.catalog, ports.events)
 
@@ -259,6 +285,31 @@ def provide_set_load_level(ports: PortsDep) -> SetLoadLevelUseCase:
     return SetLoadLevelUseCase(ports.app_state)
 
 
+def provide_list_research_runs(ports: PortsDep) -> ListResearchRunsUseCase:
+    return ListResearchRunsUseCase(ports.research)
+
+
+def provide_get_research_run(ports: PortsDep) -> GetResearchRunUseCase:
+    return GetResearchRunUseCase(ports.research)
+
+
+def provide_list_research_tenders(ports: PortsDep) -> ListResearchTendersUseCase:
+    return ListResearchTendersUseCase(ports.research)
+
+
+def provide_get_research_market(ports: PortsDep) -> GetResearchMarketUseCase:
+    return GetResearchMarketUseCase(ports.research)
+
+
+ListResearchRuns = Annotated[ListResearchRunsUseCase, Depends(provide_list_research_runs)]
+GetResearchRun = Annotated[GetResearchRunUseCase, Depends(provide_get_research_run)]
+ListResearchTenders = Annotated[
+    ListResearchTendersUseCase, Depends(provide_list_research_tenders)
+]
+GetResearchMarket = Annotated[
+    GetResearchMarketUseCase, Depends(provide_get_research_market)
+]
+
 ReadLoadLevel = Annotated[ReadLoadLevelUseCase, Depends(provide_read_load_level)]
 SetLoadLevel = Annotated[SetLoadLevelUseCase, Depends(provide_set_load_level)]
 
@@ -268,6 +319,8 @@ InspectQueues = Annotated[InspectQueuesUseCase, Depends(provide_inspect_queues)]
 RetryDeadLetter = Annotated[RetryDeadLetterUseCase, Depends(provide_retry_dead_letter)]
 CrawlerRuns = Annotated[CrawlerRunsUseCase, Depends(provide_crawler_runs)]
 DocumentPipeline = Annotated[DocumentPipelineUseCase, Depends(provide_document_pipeline)]
+CorpusOverview = Annotated[CorpusOverviewUseCase, Depends(provide_corpus_overview)]
+CorpusProcessing = Annotated[CorpusProcessingUseCase, Depends(provide_corpus_processing)]
 TenderEvents = Annotated[TenderEventsUseCase, Depends(provide_tender_events)]
 ReadSettings = Annotated[ReadSettingsUseCase, Depends(provide_read_settings)]
 ConfirmTokenRotation = Annotated[

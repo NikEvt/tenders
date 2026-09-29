@@ -9,6 +9,11 @@ from functools import lru_cache
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from libs.shared.regions import RUSSIAN_REGIONS
+
+#: Сентинел «все субъекты» для EIS_REGIONS.
+ALL_REGIONS = "all"
+
 _BASE = SettingsConfigDict(
     env_file=".env",
     env_file_encoding="utf-8",
@@ -65,12 +70,17 @@ class EisSettings(BaseSettings):
     model_config = _BASE
 
     token: SecretStr = Field(SecretStr(""), alias="EIS_TOKEN")
+    #: Коды субъектов через запятую либо `all` — все 85. Второго списка
+    #: регионов в проекте нет: `all` разворачивается по справочнику, который
+    #: уже подписывает разрезы рынка и питает пикер.
     regions: str = Field("77", alias="EIS_REGIONS")
     document_types: str = Field("epNotificationEF2020", alias="EIS_DOCUMENT_TYPES")
     crawl_interval_minutes: int = Field(60, alias="EIS_CRAWL_INTERVAL_MINUTES")
 
     @property
     def region_list(self) -> list[str]:
+        if self.regions.strip().lower() == ALL_REGIONS:
+            return list(RUSSIAN_REGIONS)
         return [r.strip() for r in self.regions.split(",") if r.strip()]
 
     @property

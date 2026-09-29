@@ -52,7 +52,8 @@ export function Inspector({
 
   const tender = detail.data?.tender;
   const verdicts = (detail.data?.verdicts ?? []) as Verdict[];
-  const topVerdict = verdicts.find((v) => v.reasoning) ?? verdicts[0];
+  // Объяснённый вердикт полезнее свежего: без основания он не проверяется.
+  const topVerdict = verdicts.find((v) => v.reason) ?? verdicts[0];
 
   return (
     <aside

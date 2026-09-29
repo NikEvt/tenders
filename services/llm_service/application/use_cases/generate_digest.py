@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from libs.shared.contracts.events import DigestRequested
+from libs.shared.day_completeness import is_closed
 from libs.shared.logging import get_logger
 from services.llm_service.application.ports import (
     DigestRepositoryPort,
+    JobTrackerPort,
     LlmPort,
     LlmUnavailable,
 )
@@ -17,7 +19,11 @@ from services.llm_service.application.prompts import (
     DIGEST_SYSTEM,
     DIGEST_USER,
 )
-from services.llm_service.domain.models import DIGEST_PROMPT_VERSION, DigestInput
+from services.llm_service.domain.models import (
+    DIGEST_PROMPT_VERSION,
+    DigestInput,
+    DigestScope,
+)
 
 log = get_logger(__name__)
 
@@ -27,6 +33,16 @@ MAX_CLUSTERS = 8
 MAX_TENDERS_PER_CLUSTER = 10
 MAX_TOP_TENDERS = 10
 
+#: Сколько черновик считается свежим. Сборка — до девяти обращений к модели, и
+#: пересобирать один и тот же идущий день на каждый рестарт сервиса значит
+#: платить за него многократно.
+DRAFT_MAX_AGE = timedelta(hours=1)
+
+#: Фазы сборки — то, что видно на шкале ожидания. Сборка идёт минутами, и без
+#: имени фазы «идёт» ничем не отличается от «встало».
+PHASE_COLLECT = "сбор закупок за день"
+PHASE_SUMMARIZE = "резюме по категориям"
+
 
 class GenerateDigestUseCase:
     """Map-reduce: резюме по категориям, затем общая сводка.
@@ -35,28 +51,60 @@ class GenerateDigestUseCase:
     поверхностный пересказ; разбиение по категориям сохраняет детали.
     """
 
-    def __init__(self, llm: LlmPort, repository: DigestRepositoryPort) -> None:
+    def __init__(
+        self,
+        llm: LlmPort,
+        repository: DigestRepositoryPort,
+        jobs: JobTrackerPort | None = None,
+    ) -> None:
         self._llm = llm
         self._repository = repository
+        self._jobs = jobs
 
     async def execute(self, event: DigestRequested) -> None:
-        if not event.force and await self._repository.exists(event.digest_date):
-            log.info("digest.already_exists", digest_date=event.digest_date.isoformat())
-            return
+        """Собирает сводку и ведёт по ней задание.
+
+        Идентификатор задания — идентификатор события: `POST /digest/{date}`
+        уже возвращает именно его, не хватало только строки в таблице. Без неё
+        экран опрашивал задание, которого нет, и пересборка не завершалась
+        никогда — сборка идёт минутами, и молчать столько нельзя.
+        """
+        job_id = str(event.event_id)
+        await self._start_job(job_id)
+        try:
+            result = await self._build(event)
+        except Exception as exc:
+            # Ошибка обязана доехать до экрана — и всё равно уйти наверх, иначе
+            # ломается разбор очереди с повторами и dead-letter.
+            await self._finish_job(job_id, error=str(exc))
+            raise
+        await self._finish_job(job_id, result=result)
+
+    async def _build(self, event: DigestRequested) -> dict:
+        if not event.force and await self._is_fresh_enough(event.digest_date):
+            log.info("digest.up_to_date", digest_date=event.digest_date.isoformat())
+            # Задание всё равно завершается: непринудительный запрос иначе
+            # оставил бы экран с вечным «идёт сборка».
+            return {"digest_date": event.digest_date.isoformat(), "skipped": True}
 
         data = await self._repository.collect(event.digest_date)
         if data.total == 0:
             await self._repository.save(
                 event.digest_date,
-                f"## Главное\n\nЗа {event.digest_date.isoformat()} новых закупок не найдено.",
-                {"total": 0},
+                _empty_digest(data),
+                {"total": 0, "scope": _scope_section(data.scope)},
                 0,
                 self._llm.model_name,
                 DIGEST_PROMPT_VERSION,
             )
-            return
+            return {"digest_date": event.digest_date.isoformat(), "tender_count": 0}
 
-        cluster_summaries = await self._summarize_clusters(data)
+        # Шагов ровно столько, сколько обращений к модели: резюме по категориям
+        # плюс сведение. Это первое место в проекте, где полоса прогресса
+        # показывает число, а не бесконечный волчок.
+        await self._set_total(str(event.event_id), min(len(data.clusters), MAX_CLUSTERS) + 1)
+
+        cluster_summaries = await self._summarize_clusters(data, str(event.event_id))
         summary = await self._reduce(data, cluster_summaries)
 
         await self._repository.save(
@@ -70,14 +118,87 @@ class GenerateDigestUseCase:
                 ],
                 "deadline_changes": [t.reg_num for t in data.deadline_changes],
                 "new_customers": data.new_customers,
+                # Область отбора едет вместе со сводкой: «16 закупок» означает
+                # разное для всего дня и для отбора по двум фильтрам.
+                "scope": _scope_section(data.scope),
             },
             tender_count=data.total,
             model=self._llm.model_name,
             prompt_version=DIGEST_PROMPT_VERSION,
         )
         log.info("digest.saved", digest_date=event.digest_date.isoformat(), total=data.total)
+        return {"digest_date": event.digest_date.isoformat(), "tender_count": data.total}
 
-    async def _summarize_clusters(self, data: DigestInput) -> dict[str, str]:
+    async def _is_fresh_enough(self, digest_date: date) -> bool:
+        """Можно ли не пересобирать сводку.
+
+        Два случая, и они разные.
+
+        **Окончательная** — собрана после окончания своего дня. Такую не
+        пересобирают никогда: день закрыт, данные по нему больше не едут. То же
+        правило, по которому краулер не считает закрытым сегодняшний суточный
+        архив.
+
+        **Свежий черновик** — собран за идущий день меньше часа назад.
+        Пересобирать его на каждый рестарт сервиса значило бы платить моделью
+        за один и тот же день по десять раз: сборка — это до девяти обращений.
+        Час выбран так, чтобы утренняя сборка и ручная пересборка не мешали
+        друг другу, а данные всё равно догонялись в течение дня.
+        """
+        built_at = await self._repository.built_at(digest_date)
+        if built_at is None:
+            return False
+        if is_closed(digest_date, built_at.date()):
+            return True
+        return datetime.now(UTC) - built_at < DRAFT_MAX_AGE
+
+    # ─── Учёт задания ───────────────────────────────────────────────────────
+    # Отметка о начале и прогресс — вспомогательные: их отказ не повод ронять
+    # сводку. Завершение и ошибка — нет: проглоченное завершение оставляет на
+    # экране вечный волчок, что хуже любой ошибки.
+
+    async def _start_job(self, job_id: str) -> None:
+        """Начало сборки. Объёма работы здесь ещё нет — его узнают после сбора.
+
+        `total = 0` уходит наружу как «неизвестно», а не как ноль: шкала в этой
+        фазе неопределённая, и это честно — считать пока нечего.
+        """
+        if self._jobs is None:
+            return
+        try:
+            await self._jobs.start(job_id, "digest", 0, PHASE_COLLECT)
+        except Exception as exc:
+            log.warning("digest.job_start_failed", job_id=job_id, error=str(exc))
+
+    async def _set_total(self, job_id: str, total: int) -> None:
+        if self._jobs is None:
+            return
+        try:
+            await self._jobs.start(job_id, "digest", total, PHASE_SUMMARIZE)
+        except Exception as exc:
+            log.warning("digest.job_total_failed", job_id=job_id, error=str(exc))
+
+    async def _report(self, job_id: str, processed: int) -> None:
+        if self._jobs is None:
+            return
+        try:
+            await self._jobs.progress(job_id, processed)
+        except Exception as exc:
+            log.warning("digest.job_progress_failed", job_id=job_id, error=str(exc))
+
+    async def _finish_job(
+        self, job_id: str, result: dict | None = None, error: str | None = None
+    ) -> None:
+        if self._jobs is None:
+            return
+        if error is not None:
+            await self._jobs.fail(job_id, error)
+        else:
+            await self._jobs.finish(job_id, result or {})
+
+    async def _summarize_clusters(
+        self, data: DigestInput, job_id: str | None = None
+    ) -> dict[str, str]:
         """Map-фаза: короткое резюме на категорию."""
         biggest = sorted(data.clusters.items(), key=lambda kv: len(kv[1]), reverse=True)
         summaries: dict[str, str] = {}
@@ -100,6 +221,9 @@ class GenerateDigestUseCase:
                 # Одна упавшая категория не должна лишать пользователя всей сводки.
                 log.warning("digest.cluster_failed", category=category)
                 summaries[category] = f"Закупок в категории: {len(tenders)}."
+
+            if job_id is not None:
+                await self._report(job_id, len(summaries))
 
         return summaries
 
@@ -137,6 +261,38 @@ class GenerateDigestUseCase:
             # это полезнее пустой страницы.
             log.warning("digest.llm_unavailable, собираем сводку без модели")
             return _fallback_digest(data, top, deadlines)
+
+
+def _scope_section(scope: DigestScope) -> dict:
+    """Область отбора в разделах сводки — чтобы клиент не выводил её сам."""
+    return {
+        "filters": scope.filters,
+        "unrun_filters": scope.unrun_filters,
+        "filtered": scope.filtered,
+    }
+
+
+def _empty_digest(data: DigestInput) -> str:
+    """Пустая сводка обязана объяснить, почему она пустая.
+
+    «Новых закупок не найдено» и «ни одна закупка не прошла ваши фильтры» —
+    разные утверждения, и путать их нельзя: первое про рынок, второе про
+    настройки. А фильтр, который ни разу не прогоняли, не приносит закупок
+    вовсе, и молчать об этом значит выдать несделанную работу за вывод.
+    """
+    day = data.digest_date.isoformat()
+    if not data.scope.filtered:
+        return f"## Главное\n\nЗа {day} новых закупок не найдено."
+
+    names = ", ".join(data.scope.filters)
+    text = f"## Главное\n\nЗа {day} ни одна закупка не прошла отбор ({names})."
+    if data.scope.unrun_filters:
+        text += (
+            f"\n\nФильтры {', '.join(data.scope.unrun_filters)} ещё ни разу не "
+            "запускались: по ним нет вердиктов, поэтому они не могли ничего "
+            "принести. Это не вывод о рынке."
+        )
+    return text
 
 
 def _fallback_digest(data: DigestInput, top: str, deadlines: str) -> str:

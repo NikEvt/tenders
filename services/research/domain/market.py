@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from statistics import median
 
+from libs.shared.regions import region_name
+
 
 @dataclass(frozen=True, slots=True)
 class MarketTender:
@@ -70,14 +72,6 @@ class MarketSummary:
 #: Сколько закупок считать «верхушкой» при расчёте доли.
 TOP_N = 3
 
-#: Названия регионов для человекочитаемой подписи. Список короткий намеренно:
-#: полный справочник субъектов — забота интерфейса, а не сводки.
-REGION_NAMES = {
-    "77": "Москва",
-    "78": "Санкт-Петербург",
-    "50": "Московская область",
-    "47": "Ленинградская область",
-}
 
 
 def summarize(tenders: Sequence[MarketTender], top_n: int = TOP_N) -> MarketSummary:
@@ -101,7 +95,7 @@ def summarize(tenders: Sequence[MarketTender], top_n: int = TOP_N) -> MarketSumm
     summary.by_region = _group(
         tenders,
         key=lambda t: t.region_code or "—",
-        label=lambda key: REGION_NAMES.get(key, key),
+        label=region_name,
     )
     # По ИНН, а не по названию: учреждение пишет своё имя по-разному.
     summary.by_customer = _group(

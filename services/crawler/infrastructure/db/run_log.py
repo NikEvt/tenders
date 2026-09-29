@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from libs.shared.db.schema import CrawlerRun
 from services.crawler.application.ports import CrawlRunLogPort
+from services.crawler.domain.coverage import is_final
 from services.crawler.domain.models import CrawlRequest, CrawlResult
 
 
@@ -40,10 +41,18 @@ class SqlCrawlRunLog(CrawlRunLogPort):
         return run_id
 
     async def completed(self, since: date, until: date) -> set[tuple[str, str, date]]:
-        """Что уже выгружено успешно за период.
+        """Что уже выгружено успешно **и окончательно** за период.
 
-        Только `status = 'success'`: провалившийся день обязан быть повторён,
-        иначе дыра в покрытии станет постоянной и незаметной.
+        Два условия, и оба обязательны.
+
+        `status = 'success'`: провалившийся день обязан быть повторён, иначе
+        дыра в покрытии станет постоянной и незаметной.
+
+        `is_final`: успех сам по себе не означает полноту — суточный архив ЕИС
+        дописывается до конца суток. Правило формулирует домен, здесь оно
+        только применяется. Фильтр идёт по загруженным строкам, а не условием
+        в SQL: так формулировка остаётся одна, а строк тут в худшем случае
+        период × регионы, то есть тысячи.
         """
         async with self._session_factory() as session:
             rows = (
@@ -52,6 +61,7 @@ class SqlCrawlRunLog(CrawlRunLogPort):
                         CrawlerRun.region,
                         CrawlerRun.document_type,
                         CrawlerRun.target_date,
+                        CrawlerRun.started_at,
                     )
                     .where(
                         CrawlerRun.status == "success",
@@ -67,6 +77,7 @@ class SqlCrawlRunLog(CrawlRunLogPort):
             (row.region, row.document_type, row.target_date)
             for row in rows
             if row.region and row.document_type
+            if is_final(row.target_date, row.started_at.date())
         }
 
     async def finish(self, run_id: int, result: CrawlResult) -> None:

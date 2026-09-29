@@ -81,7 +81,7 @@ def to_criteria(filters: TenderFilter) -> TenderCriteria:
         documents_status=filters.documents_status,
         has_text=filters.has_text,
         filter_id=filters.filter_id,
-        matched_only=filters.matched_only,
+        filter_verdicts=filters.filter_verdicts,
     )
 
 

@@ -62,6 +62,16 @@ MAX_EIS_RPS = 14.0
 #: замерено в том же прогоне.
 MAX_CRAWL_WORKERS = 6
 
+#: Пик памяти на одну одновременную выгрузку, МиБ. Суточный архив региона
+#: скачивается и распаковывается в память целиком, поэтому цена параллельности
+#: здесь такая же прямая, как у разбора документов.
+#:
+#: Замерено 14 августа 2026: 85 регионов за день, три рабочих — пик 633 МиБ,
+#: то есть ~210 МиБ на выгрузку. Значение округлено вверх с запасом на регионы
+#: крупнее Москвы. До замера потолка не было вовсе, и краулер с лимитом 256 МиБ
+#: дважды перезапустился на середине обхода страны.
+PEAK_CRAWL_MB = 224
+
 
 class LoadLevel(IntEnum):
     """Уровень нагрузки на машину."""
@@ -182,6 +192,7 @@ def resolve(
     cpu_count: int | None = None,
     memory_mb: int | None = None,
     peak_extraction_mb: int = PEAK_EXTRACTION_MB,
+    peak_crawl_mb: int = PEAK_CRAWL_MB,
 ) -> LoadBudget:
     """Потолки для уровня на этой машине.
 
@@ -201,6 +212,12 @@ def resolve(
         workers = max(min(by_cpu, memory_mb // peak_extraction_mb), 1)
     else:
         workers = by_cpu
+
+    # Тот же расчёт для выгрузки: архив региона распаковывается в память
+    # целиком, и три одновременных обхода стоят дороже, чем весь остальной
+    # краулер вместе взятый.
+    if memory_mb is not None and peak_crawl_mb > 0:
+        crawl_workers = max(min(crawl_workers, memory_mb // peak_crawl_mb), 1)
 
     return LoadBudget(
         level=level,

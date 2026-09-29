@@ -13,10 +13,14 @@ const chip = cva(
       kind: {
         /** Структурное условие — официальный синий: это уйдёт в SQL. */
         structural: "border-gos-tint surface-gos-tint",
-        /** Семантический запрос — нейтральный, в кавычках. */
-        semantic: "border-hairline bg-surface-sunken text-text",
-        /** Критерий для судьи — та же бумага, что и вердикт. */
-        llm: "border-vellum-edge surface-vellum",
+        /** Термин: ищется по тексту документов, а не по карточке. */
+        term: "border-hairline bg-surface-sunken text-text",
+        /**
+         * Правило по контексту. Бумага здесь неуместна: правило решает без
+         * модели, и выдавать его за «пометку ИИ» значило бы приписать машине
+         * работу, которой она не делала.
+         */
+        rule: "border-oak-tint surface-oak-tint",
       },
     },
     defaultVariants: { kind: "structural" },

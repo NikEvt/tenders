@@ -110,10 +110,10 @@ export function KitchenSink() {
           <Chip kind="structural" onRemove={() => {}}>
             Санкт-Петербург
           </Chip>
-          <Chip kind="semantic" onRemove={() => {}}>
+          <Chip kind="term" onRemove={() => {}}>
             «лабораторные расходники»
           </Chip>
-          <Chip kind="llm" onRemove={() => {}}>
+          <Chip kind="rule" onRemove={() => {}}>
             гарантия не менее 3 лет
           </Chip>
         </div>

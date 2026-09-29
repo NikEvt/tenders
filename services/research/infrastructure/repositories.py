@@ -29,7 +29,7 @@ from services.research.application.ports import (
     ResearchRunPort,
     ScanStats,
     TenderVerdict,
-    VerdictCachePort,
+    VerdictStorePort,
 )
 from services.research.domain.criteria import (
     Confidence,
@@ -42,6 +42,11 @@ from services.research.domain.hits import Hit
 #: Сколько карточек тянуть за раз. Корпус — сотни тысяч строк, и держать его
 #: в памяти незачем: движку нужна одна закупка за раз.
 TENDER_BATCH = 500
+
+#: Сколько вердиктов писать одним INSERT. Полный прогон по корпусу приносит
+#: тысячи решений, а одно выражение на все — лишний способ упереться в предел
+#: параметров запроса.
+VERDICT_BATCH = 500
 
 
 class SqlCorpusRepository(CorpusPort):
@@ -99,6 +104,13 @@ class SqlCorpusRepository(CorpusPort):
                 )
 
     async def documents(self, tender_id: int) -> list[CorpusDocument]:
+        """Все вложения закупки, в том числе ещё не разобранные.
+
+        Внешнее соединение, а не внутреннее: документ без текста — это и есть
+        знаменатель воронки, и считать его надо там же, где считается
+        числитель, то есть в обходе кандидатов. Отдельный запрос по всему
+        корпусу считал другую популяцию и завышал знаменатель в разы.
+        """
         async with self._session_factory() as session:
             rows = (
                 await session.execute(
@@ -107,11 +119,8 @@ class SqlCorpusRepository(CorpusPort):
                         DocumentText.text_key,
                         TenderDocument.file_name,
                     )
-                    .join(DocumentText, DocumentText.document_id == TenderDocument.id)
-                    .where(
-                        TenderDocument.tender_id == tender_id,
-                        DocumentText.text_key.is_not(None),
-                    )
+                    .outerjoin(DocumentText, DocumentText.document_id == TenderDocument.id)
+                    .where(TenderDocument.tender_id == tender_id)
                     .order_by(TenderDocument.priority.nullslast(), TenderDocument.id)
                 )
             ).all()
@@ -130,27 +139,6 @@ class SqlCorpusRepository(CorpusPort):
                     select(func.count())
                     .select_from(Tender)
                     .where(*_period(regions, since, until, self._structural))
-                )
-            ) or 0
-
-    async def count_unscanned(
-        self, regions: Sequence[str] | None, since: date | None, until: date | None
-    ) -> int:
-        """Документы без извлечённого текста — знаменатель воронки.
-
-        Именно это число не даёт принять «находок нет» за «здесь ничего нет».
-        """
-        async with self._session_factory() as session:
-            return (
-                await session.scalar(
-                    select(func.count())
-                    .select_from(TenderDocument)
-                    .join(Tender, Tender.id == TenderDocument.tender_id)
-                    .outerjoin(DocumentText, DocumentText.document_id == TenderDocument.id)
-                    .where(
-                        *_period(regions, since, until, self._structural),
-                        DocumentText.text_key.is_(None),
-                    )
                 )
             ) or 0
 
@@ -242,19 +230,31 @@ class SqlResearchRunRepository(ResearchRunPort):
                 )
             )
 
+    async def fail(self, run_id: int, error: str) -> None:
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                update(ResearchRun)
+                .where(ResearchRun.id == run_id)
+                .values(status="failed", finished_at=func.now(), error_message=error[:2000])
+            )
 
-class SqlVerdictCache(VerdictCachePort):
-    """Кэш решений модели.
+
+class SqlVerdictStore(VerdictStorePort):
+    """Решения по закупкам: и кэш модели, и то, по чему отбирает каталог.
 
     Ключ не включает прогон: решение принадлежит паре «закупка + критерий».
     Поэтому повторный прогон не тратит токенов, а правка шаблонов обесценивает
-    кэш сама собой — через версию критериев.
+    прежние решения сама собой — через версию критериев.
+
+    Сюда же ходит `libs/shared/db/tender_criteria.py` за отбором по
+    сохранённому фильтру, так что таблица — источник истины для выдачи, а не
+    только хранилище оплаченных ответов.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def cached(
+    async def stored(
         self, tender_ids: Sequence[int], criteria_version: str, prompt_version: str
     ) -> dict[int, TenderVerdict]:
         if not tender_ids:
@@ -284,36 +284,52 @@ class SqlVerdictCache(VerdictCachePort):
 
     async def save(
         self,
-        verdict: TenderVerdict,
+        verdicts: Sequence[TenderVerdict],
         criteria_version: str,
         prompt_version: str,
         model: str,
     ) -> None:
+        if not verdicts:
+            return
+
+        # Последний вердикт по закупке побеждает: Postgres отказывается
+        # применять ON CONFLICT DO UPDATE дважды к одной строке в пределах
+        # одного INSERT, а внутри прогона решение по закупке ровно одно.
+        unique = {verdict.tender_id: verdict for verdict in verdicts}
+        rows = [
+            {
+                "tender_id": verdict.tender_id,
+                "criteria_version": criteria_version,
+                "prompt_version": prompt_version,
+                "confidence": str(verdict.confidence),
+                "reason": verdict.reason,
+                "score": verdict.score,
+                "decided_by": verdict.decided_by,
+                "evidence": verdict.evidence,
+                # У решения правил модели нет — и `model IS NULL` означает
+                # ровно «это решение ничего не стоило».
+                "model": model if verdict.decided_by == "model" else None,
+            }
+            for verdict in unique.values()
+        ]
+
         async with self._session_factory() as session, session.begin():
-            statement = pg_insert(ResearchVerdict).values(
-                tender_id=verdict.tender_id,
-                criteria_version=criteria_version,
-                prompt_version=prompt_version,
-                confidence=str(verdict.confidence),
-                reason=verdict.reason,
-                score=verdict.score,
-                decided_by=verdict.decided_by,
-                evidence=verdict.evidence,
-                model=model,
-            )
-            await session.execute(
-                statement.on_conflict_do_update(
-                    constraint="uq_research_verdict",
-                    set_={
-                        "confidence": statement.excluded.confidence,
-                        "reason": statement.excluded.reason,
-                        "score": statement.excluded.score,
-                        "decided_by": statement.excluded.decided_by,
-                        "evidence": statement.excluded.evidence,
-                        "model": statement.excluded.model,
-                    },
+            for start in range(0, len(rows), VERDICT_BATCH):
+                chunk = rows[start : start + VERDICT_BATCH]
+                statement = pg_insert(ResearchVerdict).values(chunk)
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        constraint="uq_research_verdict",
+                        set_={
+                            "confidence": statement.excluded.confidence,
+                            "reason": statement.excluded.reason,
+                            "score": statement.excluded.score,
+                            "decided_by": statement.excluded.decided_by,
+                            "evidence": statement.excluded.evidence,
+                            "model": statement.excluded.model,
+                        },
+                    )
                 )
-            )
 
 
 def _period(
@@ -328,6 +344,11 @@ def _period(
     закупки подходят». Второй набор предикатов уже заводился однажды и разошёлся
     с первым: префикс `20.11` находил `26.20.11.110`, и судья получал ноутбуки
     в кандидаты фильтра по газам.
+
+    Регионы прогона **перекрывают** регионы критерия, а не объединяются с ними.
+    Регионы критерия — умолчание, выбранные при запуске — воля пользователя:
+    объединение молча расширило бы прогон за пределы запрошенного, и
+    знаменатель воронки перестал бы соответствовать тому, что просили.
     """
     conditions = list(
         predicates(
@@ -406,3 +427,18 @@ class SqlCriteriaRepository:
         spec = dict(row.spec or {})
         spec.setdefault("name", row.name)
         return criteria_from_spec(spec)
+
+    async def mark_run(self, filter_id: int) -> None:
+        """Отмечает, что по критерию прошёл настоящий прогон.
+
+        Пробный прогон сюда не попадает: отметка отвечает на вопрос «есть ли по
+        этому фильтру вердикты», а тест их не оставляет. Меню фильтров на
+        каталоге показывает по ней «не запускался» — выбор такого фильтра даёт
+        пустую выдачу, и сказать об этом до клика честнее, чем после.
+        """
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                update(SavedFilter)
+                .where(SavedFilter.id == filter_id)
+                .values(last_run_at=func.now())
+            )

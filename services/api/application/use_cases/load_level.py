@@ -5,15 +5,19 @@
 читают, каждый в своём темпе.
 
 Смена уровня ничего не применяет прямо здесь и не ждёт, пока применят воркеры:
-запись в настройку — это заявка, а не команда. Ответ описывает потолки, которые
-получатся **на машине шлюза**; у воркера с другим лимитом памяти числа могут
-отличаться, и выдавать их за общие было бы неправдой.
+запись в настройку — это заявка, а не команда.
+
+Потолки в ответе считаются по числу ядер, но **без** поправки на память: пул
+разборщиков живёт в docs-worker, у которого свой лимит, а у шлюза он намеренно
+тесный (448 МиБ). Считая по памяти шлюза, ответ отдавал один разборщик на всех
+трёх уровнях — переключатель выглядел ни на что не влияющим, хотя воркер честно
+поднимал пять. Поправку на память накладывает тот, кто разбирает.
 """
 
 from __future__ import annotations
 
 from libs.shared.load_control import LOAD_LEVEL_KEY
-from libs.shared.load_policy import LoadBudget, LoadLevel, resolve_current
+from libs.shared.load_policy import LoadBudget, LoadLevel, detect_cpu_count, resolve
 from services.api.application.ports.monitoring import AppStatePort
 
 
@@ -24,7 +28,7 @@ class ReadLoadLevelUseCase:
     async def execute(self) -> LoadBudget:
         stored = await self._state.get(LOAD_LEVEL_KEY)
         raw = stored.get("level") if isinstance(stored, dict) else None
-        return resolve_current(LoadLevel.parse(raw))
+        return resolve(LoadLevel.parse(raw), cpu_count=detect_cpu_count())
 
 
 class SetLoadLevelUseCase:
@@ -35,4 +39,4 @@ class SetLoadLevelUseCase:
 
     async def execute(self, level: LoadLevel) -> LoadBudget:
         await self._state.set(LOAD_LEVEL_KEY, {"level": int(level)})
-        return resolve_current(level)
+        return resolve(level, cpu_count=detect_cpu_count())

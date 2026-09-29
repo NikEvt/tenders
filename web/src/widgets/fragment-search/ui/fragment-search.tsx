@@ -11,6 +11,7 @@ import { EmptyState } from "@/shared/ui/empty-state";
 import { Input } from "@/shared/ui/field";
 import { Segmented } from "@/shared/ui/segmented";
 import { ListSkeleton } from "@/shared/ui/skeleton";
+import { WaitingBlock, useWaitingSince } from "@/shared/ui/waiting-block";
 import { CopyableMono } from "@/shared/ui/mono";
 import { ru } from "@/shared/i18n/ru";
 import { compactMoney } from "@/shared/lib/format";
@@ -53,6 +54,8 @@ export function FragmentSearch() {
     staleTime: STALE.list,
   });
 
+  const searchingSince = useWaitingSince(ready && results.isLoading);
+
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center gap-3">
@@ -89,7 +92,18 @@ export function FragmentSearch() {
           body="Ищет по тексту приложенной документации: часть требований звучит только в ТЗ и в наименование извещения не попадает."
         />
       ) : results.isLoading ? (
-        <ListSkeleton rows={6} />
+        <>
+          {/* Векторная ветка идёт через модель эмбеддингов, и на холодной
+              модели первый запрос упирается в тридцать секунд (замер в
+              `embedding_service/presentation/app.py`). Скелетон один этого не
+              объясняет: он выглядит одинаково и на секунду, и на полминуты. */}
+          <WaitingBlock
+            title={ru.waiting.searching}
+            startedAt={searchingSince}
+            hint={params.mode === "lexical" ? undefined : ru.waiting.searchingHint}
+          />
+          <ListSkeleton rows={6} />
+        </>
       ) : (results.data?.items.length ?? 0) === 0 ? (
         <EmptyState
           icon={<FileSearch strokeWidth={1.5} />}

@@ -10,10 +10,9 @@ from services.research.domain.criteria import OXYGEN_DEMAND_CRITERIA as CRITERIA
 
 
 class FakeCorpus:
-    def __init__(self, tenders, documents=None, unscanned: int = 0) -> None:
+    def __init__(self, tenders, documents=None) -> None:
         self._tenders = tenders
         self._documents = documents or {}
-        self._unscanned = unscanned
         self.documents_asked: list[int] = []
 
     async def tenders(self, regions, since, until) -> AsyncIterator[CorpusTender]:
@@ -27,9 +26,6 @@ class FakeCorpus:
     async def count_tenders(self, regions, since, until) -> int:
         return len(self._tenders)
 
-    async def count_unscanned(self, regions, since, until) -> int:
-        return self._unscanned
-
 
 class FakeTexts:
     def __init__(self, texts: dict[str, str], broken: set[str] | None = None) -> None:
@@ -42,6 +38,17 @@ class FakeTexts:
         if text_key in self.broken:
             raise OSError("объект недоступен")
         return self.texts[text_key]
+
+
+class FakeProgress:
+    def __init__(self, breaks: bool = False) -> None:
+        self.reports: list[tuple[int, int]] = []
+        self.breaks = breaks
+
+    async def report(self, processed: int, total: int) -> None:
+        if self.breaks:
+            raise RuntimeError("база недоступна")
+        self.reports.append((processed, total))
 
 
 class FakeHits:
@@ -147,14 +154,67 @@ class TestResilience:
 
 class TestFunnel:
     async def test_denominators_are_reported(self) -> None:
-        """«Находок нет» без знаменателя не значит ничего."""
-        corpus = FakeCorpus([WATER, FURNITURE], unscanned=63714)
-        stats = await ScanCorpusUseCase(CRITERIA, corpus, FakeTexts({})).execute()
+        """«Находок нет» без знаменателя не значит ничего.
+
+        Знаменатель считается по тем же закупкам, что и числитель, — по
+        кандидатам. Отдельный запрос по всему корпусу считал другую популяцию
+        и завышал «не прочитано» в разы.
+        """
+        documents = {
+            1: [CorpusDocument(10, "k", "ТЗ.docx"), CorpusDocument(11, None, "скан.pdf")],
+            # Документы не-кандидата в знаменатель попадать не должны.
+            2: [CorpusDocument(20, None, "смета.pdf")],
+        }
+        corpus = FakeCorpus([WATER, FURNITURE], documents)
+
+        stats = await ScanCorpusUseCase(
+            CRITERIA, corpus, FakeTexts({"k": "ХПК не более 30 мг/дм3"})
+        ).execute()
 
         assert stats.tenders_total == 2
         assert stats.tenders_candidate == 1
-        # То, до чего не дошли, видно отдельным числом.
-        assert stats.documents_pending == 63714
+        assert stats.documents_scanned == 1
+        # То, до чего не дошли, видно отдельным числом — и сопоставимо с прочитанным.
+        assert stats.documents_pending == 1
+
+    async def test_progress_opens_and_closes(self) -> None:
+        """Первый и последний доклад идут всегда: иначе полоса не появится."""
+        progress = FakeProgress()
+
+        await ScanCorpusUseCase(
+            CRITERIA, FakeCorpus([WATER, FURNITURE]), FakeTexts({}), progress=progress
+        ).execute()
+
+        assert progress.reports[0] == (0, 2)
+        assert progress.reports[-1] == (2, 2)
+
+    async def test_progress_is_throttled(self) -> None:
+        """Запись на каждую закупку при корпусе в сотни тысяч — своя же беда."""
+        tenders = [
+            CorpusTender(tender_id=i, reg_num=f"R-{i}", name="Поставка мебели")
+            for i in range(1, 121)
+        ]
+        progress = FakeProgress()
+
+        await ScanCorpusUseCase(
+            CRITERIA, FakeCorpus(tenders), FakeTexts({}), progress=progress
+        ).execute()
+
+        # 0, 50, 100 и закрывающий 120 — а не сто двадцать записей подряд.
+        assert [p for p, _ in progress.reports] == [0, 50, 100, 120]
+
+    async def test_a_broken_progress_does_not_sink_the_scan(self) -> None:
+        """Вспомогательное не роняет основное."""
+        corpus = FakeCorpus([WATER], {1: [CorpusDocument(10, "k", "ТЗ.docx")]})
+
+        stats = await ScanCorpusUseCase(
+            CRITERIA,
+            corpus,
+            FakeTexts({"k": "ХПК не более 30 мг/дм3"}),
+            progress=FakeProgress(breaks=True),
+        ).execute()
+
+        assert stats.hits_found == 1
 
     async def test_zero_hits_is_reported_with_its_denominator(self) -> None:
         corpus = FakeCorpus([WATER], {1: [CorpusDocument(10, "k", "ТЗ.docx")]})

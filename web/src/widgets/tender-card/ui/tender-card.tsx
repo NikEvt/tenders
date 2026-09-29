@@ -17,7 +17,7 @@ import { dateShort, money, regionName, toDate } from "@/shared/lib/format";
 import { useHotkeys } from "@/shared/lib/hooks";
 import { endpoints } from "@/shared/api/endpoints";
 import { qk, STALE } from "@/shared/api/query-keys";
-import type { Evidence, TenderDetail, Verdict } from "@/shared/api/types";
+import type { TenderDetail, Verdict } from "@/shared/api/types";
 import { StatusPill } from "@/entities/tender/ui/status-pill";
 import { VerdictNote } from "@/entities/verdict/ui/verdict-note";
 import { FeedbackStrip } from "@/features/rate-tender/ui/feedback-strip";
@@ -170,11 +170,10 @@ export function TenderCard({ regNum }: { regNum: string }) {
               ) : (
                 verdicts.map((verdict, index) => (
                   <VerdictNote
-                    key={`${verdict.filter_id}-${index}`}
+                    key={`${verdict.criteria_version}-${index}`}
                     verdict={verdict}
                     model="qwen3.6-35b"
                     reasoningEffort="low"
-                    citationHref={(evidence) => citationHref(regNum, evidence)}
                   />
                 ))
               )}
@@ -246,16 +245,15 @@ function tabLabel(tab: Tab, detail: TenderDetail | undefined): string {
   }[tab];
 }
 
-/**
- * Ссылка на источник вердикта. `chunk_id` есть, а смещений чанка в тексте нет —
- * просмотрщик честно скажет об этом, вместо того чтобы подсветить наугад
- * (docs/API-GAPS.md §4).
+/*
+ * Ссылки «показать источник» здесь больше нет.
+ *
+ * Прежде она вела в документ по `chunk_id`. Находка на чанк не ссылается: она
+ * несёт цитату со смещением совпадения внутри неё, и перехода «находка → место
+ * в документе» в API пока нет. Выдумывать якорь и подсвечивать наугад хуже, чем
+ * показать цитату с подсветкой и назвать файл — что и делает VerdictNote.
+ * Записано в web/docs/API-GAPS.md.
  */
-function citationHref(regNum: string, evidence: Evidence): string | null {
-  if (!evidence.document_id) return null;
-  const anchor = evidence.chunk_id ? `#chunk-${evidence.chunk_id}` : "";
-  return `/tenders/${regNum}/documents/${evidence.document_id}${anchor}`;
-}
 
 function okpd2(code: string | null, name: string | null): string | null {
   if (!code) return null;

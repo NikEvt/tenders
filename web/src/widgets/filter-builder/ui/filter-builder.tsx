@@ -8,35 +8,44 @@ import { Card } from "@/shared/ui/card";
 import { Field, Input, Textarea } from "@/shared/ui/field";
 import { Chip } from "@/shared/ui/chip";
 import { Banner } from "@/shared/ui/banner";
-import { Mono } from "@/shared/ui/mono";
 import { PageHeader } from "@/shared/ui/section";
 import { useToast } from "@/shared/ui/toast";
+import { WaitingBlock, useWaitingSince } from "@/shared/ui/waiting-block";
 import { ru } from "@/shared/i18n/ru";
 import { cn } from "@/shared/lib/cn";
-import { money, regionName } from "@/shared/lib/format";
 import { endpoints } from "@/shared/api/endpoints";
-import type { FilterSpec } from "@/shared/api/types";
+import type { ContextRule, CriteriaSpec, Term } from "@/shared/api/types";
 import { useCompileFilter } from "@/features/compile-filter/model/use-compile-filter";
 import { compiledConditions } from "@/features/compile-filter/ui/compiled-chips";
 import { FilterFunnel } from "@/features/test-filter/ui/funnel";
 
-const EMPTY_SPEC: FilterSpec = {
-  keywords: [],
+const EMPTY_SPEC: CriteriaSpec = {
+  name: "",
+  terms: [],
+  context_rules: [],
+  card_pattern: null,
   okpd2_prefixes: [],
-  price_min: null,
-  price_max: null,
-  regions: [],
-  customer_inns: [],
-  date_range: null,
-  only_active: true,
-  semantic_query: "",
-  llm_criteria: "",
+  structural: {
+    regions: [],
+    customer_inns: [],
+    price_min: null,
+    price_max: null,
+    only_active: true,
+  },
+  version: "v1",
 };
 
 /**
- * Конструктор фильтра: три панели в том порядке, в котором работает конвейер.
- * Дешёвый SQL → векторный отбор → дорогой судья. Порядок панелей и есть
- * объяснение, почему судья читает десятки документов, а не всю базу.
+ * Конструктор критерия: три панели в том порядке, в котором работает отбор.
+ *
+ * Где искать → что искать → как отличить своё. Порядок и есть объяснение,
+ * почему модель читает единицы закупок, а не всю базу: предфильтр сужает
+ * корпус, термины находят упоминания, правила по контексту решают уверенные
+ * случаи бесплатно, и до судьи доходит только спорное.
+ *
+ * Третья панель — главная по ценности и потому не спрятана в «дополнительно»:
+ * на размеченном наборе правила по контексту отсекли все ложные срабатывания,
+ * не потратив ни одного токена.
  */
 export function FilterBuilder() {
   const router = useRouter();
@@ -45,10 +54,11 @@ export function FilterBuilder() {
 
   const [name, setName] = React.useState("");
   const [query, setQuery] = React.useState("");
-  const [spec, setSpec] = React.useState<FilterSpec>(EMPTY_SPEC);
+  const [spec, setSpec] = React.useState<CriteriaSpec>(EMPTY_SPEC);
   const [edited, setEdited] = React.useState(false);
 
   const [savedId, setSavedId] = React.useState<number | null>(null);
+  const compilingSince = useWaitingSince(compile.isPending);
 
   const save = useMutation({
     // Правленый spec уходит на сервер как есть: перекомпиляция текста откатила
@@ -60,7 +70,7 @@ export function FilterBuilder() {
     },
   });
 
-  const patch = (next: FilterSpec) => {
+  const patch = (next: CriteriaSpec) => {
     setSpec(next);
     setEdited(true);
   };
@@ -114,6 +124,15 @@ export function FilterBuilder() {
             </p>
           ) : null}
         </div>
+
+        {/* Компиляция идёт до полуминуты. Спиннера в кнопке для такого срока
+            мало: тишина неотличима от зависшего интерфейса, и именно здесь
+            пользователь ждёт, глядя в пустое место будущего критерия. */}
+        <WaitingBlock
+          title={ru.waiting.compiling}
+          startedAt={compilingSince}
+          hint={ru.waiting.compilingHint}
+        />
       </Card>
 
       {edited ? (
@@ -124,56 +143,52 @@ export function FilterBuilder() {
         />
       ) : null}
 
-      <Panel
-        step={1}
-        title={ru.filters.stepStructural}
-        hint={ru.filters.stepStructuralHint}
-      >
-        {structural.length === 0 ? (
-          <p className="text-body-sm text-text-subtle">{ru.filters.noConditions}</p>
-        ) : (
-          <ul className="flex flex-wrap gap-1.5">
-            {structural.map((condition) => (
-              <li key={condition.id}>
-                <Chip kind="structural" onRemove={() => patch(condition.remove(spec))}>
-                  {condition.label}
-                </Chip>
-              </li>
-            ))}
-          </ul>
-        )}
+      <Panel step={1} title={ru.filters.stepWhere} hint={ru.filters.stepWhereHint}>
+        <div className="flex flex-col gap-3">
+          <Field label={ru.filters.cardPattern} htmlFor="card-pattern">
+            <Input
+              id="card-pattern"
+              value={spec.card_pattern ?? ""}
+              onChange={(event) =>
+                patch({ ...spec, card_pattern: event.target.value || null })
+              }
+              placeholder="вод|сточн|лаборатор"
+              className="font-mono text-mono"
+            />
+          </Field>
 
-        <details className="mt-4">
-          <summary className="cursor-pointer text-body-sm text-gos-fg">
-            {ru.filters.sqlPreview}
-          </summary>
-          <Mono className="mt-2 block whitespace-pre-wrap rounded-[6px] bg-surface-sunken p-3 text-text">
-            {sqlPreview(spec)}
-          </Mono>
-        </details>
+          {structural.length === 0 ? (
+            <p className="text-body-sm text-text-subtle">{ru.filters.noConditions}</p>
+          ) : (
+            <ul className="flex flex-wrap gap-1.5">
+              {structural.map((condition) => (
+                <li key={condition.id}>
+                  <Chip kind="structural" onRemove={() => patch(condition.remove(spec))}>
+                    {condition.label}
+                  </Chip>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </Panel>
 
-      <Panel step={2} title={ru.filters.stepSemantic} hint={ru.filters.semanticHint}>
-        <Textarea
-          value={spec.semantic_query}
-          onChange={(event) => patch({ ...spec, semantic_query: event.target.value })}
-          placeholder={ru.filters.semanticPlaceholder}
-          rows={2}
+      <Panel step={2} title={ru.filters.stepWhat} hint={ru.filters.stepWhatHint}>
+        <TermRows
+          terms={spec.terms}
+          onChange={(terms) => patch({ ...spec, terms })}
         />
+        {spec.terms.length > 0 && !spec.terms.some((t) => t.role === "primary") ? (
+          <p role="alert" className="mt-2 text-body-sm text-signal-fg">
+            {ru.filters.noPrimaryTerm}
+          </p>
+        ) : null}
       </Panel>
 
-      <Panel
-        step={3}
-        title={ru.filters.stepJudge}
-        hint={ru.filters.judgeCost(40, 2)}
-        vellum
-      >
-        <Textarea
-          value={spec.llm_criteria}
-          onChange={(event) => patch({ ...spec, llm_criteria: event.target.value })}
-          placeholder={ru.filters.judgePlaceholder}
-          rows={2}
-          className="bg-transparent"
+      <Panel step={3} title={ru.filters.stepTell} hint={ru.filters.stepTellHint}>
+        <RuleRows
+          rules={spec.context_rules}
+          onChange={(context_rules) => patch({ ...spec, context_rules })}
         />
       </Panel>
 
@@ -240,29 +255,168 @@ function Panel({
   );
 }
 
-/** Читаемый эквивалент структурных условий. Только предпросмотр, не исполняется. */
-function sqlPreview(spec: FilterSpec): string {
-  const where: string[] = [];
+/**
+ * Строки терминов: шаблон, название и роль.
+ *
+ * Роль показана переключателем, а не спрятана: вспомогательный термин сам по
+ * себе ничего не значит, и закупка, где сработали только такие, отвергается
+ * целиком. Пользователь, не видящий роли, не поймёт, почему находки исчезли.
+ */
+function TermRows({
+  terms,
+  onChange,
+}: {
+  terms: Term[];
+  onChange: (terms: Term[]) => void;
+}) {
+  const update = (index: number, patch: Partial<Term>) =>
+    onChange(terms.map((term, i) => (i === index ? { ...term, ...patch } : term)));
 
-  if (spec.keywords?.length) {
-    where.push(`search_vector @@ plainto_tsquery('russian', '${spec.keywords.join(" ")}')`);
-  }
-  for (const prefix of spec.okpd2_prefixes ?? []) {
-    where.push(`okpd2_code LIKE '${prefix}%'`);
-  }
-  if (spec.regions?.length) {
-    where.push(`region_code IN (${spec.regions.map((r) => `'${r}'`).join(", ")})  -- ${spec.regions.map(regionName).join(", ")}`);
-  }
-  for (const inn of spec.customer_inns ?? []) {
-    where.push(`customer_inn = '${inn}'`);
-  }
-  if (spec.price_min !== null && spec.price_min !== undefined) {
-    where.push(`price >= ${spec.price_min}  -- ${money(spec.price_min)}`);
-  }
-  if (spec.price_max !== null && spec.price_max !== undefined) {
-    where.push(`price <= ${spec.price_max}  -- ${money(spec.price_max)}`);
-  }
-  if (spec.only_active) where.push("end_date > now()");
+  return (
+    <div className="flex flex-col gap-2">
+      {terms.map((term, index) => (
+        <div key={index} className="flex flex-wrap items-end gap-2">
+          <Field label={ru.filters.termName} htmlFor={`term-name-${index}`} className="w-48">
+            <Input
+              id={`term-name-${index}`}
+              value={term.name}
+              onChange={(event) => update(index, { name: event.target.value })}
+            />
+          </Field>
+          <Field
+            label={ru.filters.termPattern}
+            htmlFor={`term-pattern-${index}`}
+            className="min-w-64 flex-1"
+          >
+            <Input
+              id={`term-pattern-${index}`}
+              value={term.pattern}
+              onChange={(event) => update(index, { pattern: event.target.value })}
+              className="font-mono text-mono"
+            />
+          </Field>
+          <Button
+            variant="ghost"
+            onClick={() =>
+              update(index, {
+                role: term.role === "primary" ? "supporting" : "primary",
+              })
+            }
+            title={ru.filters.roleHint}
+          >
+            {term.role === "primary" ? ru.filters.rolePrimary : ru.filters.roleSupporting}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => onChange(terms.filter((_, i) => i !== index))}
+            aria-label={ru.common.delete}
+          >
+            ×
+          </Button>
+        </div>
+      ))}
+      <div>
+        <Button
+          variant="secondary"
+          onClick={() => onChange([...terms, { name: "", pattern: "", role: "primary" }])}
+        >
+          {ru.filters.addTerm}
+        </Button>
+      </div>
+    </div>
+  );
+}
 
-  return `SELECT * FROM tenders\nWHERE ${where.length ? where.join("\n  AND ") : "true"}`;
+/**
+ * Правила по контексту.
+ *
+ * Окно — число со смыслом, а не ползунок «чувствительности»: ±60 символов это
+ * примерно три-четыре слова, ровно столько занимает «ХПК Мариинского театра».
+ * Пустое окно означает «смотреть цитату целиком», и у правил «против» это
+ * почти всегда ошибка — на цитате в ±220 символов найдётся что угодно.
+ */
+function RuleRows({
+  rules,
+  onChange,
+}: {
+  rules: ContextRule[];
+  onChange: (rules: ContextRule[]) => void;
+}) {
+  const update = (index: number, patch: Partial<ContextRule>) =>
+    onChange(rules.map((rule, i) => (i === index ? { ...rule, ...patch } : rule)));
+
+  return (
+    <div className="flex flex-col gap-2">
+      {rules.map((rule, index) => (
+        <div key={index} className="flex flex-wrap items-end gap-2">
+          <Field label={ru.filters.termName} htmlFor={`rule-name-${index}`} className="w-48">
+            <Input
+              id={`rule-name-${index}`}
+              value={rule.name}
+              onChange={(event) => update(index, { name: event.target.value })}
+            />
+          </Field>
+          <Field
+            label={ru.filters.termPattern}
+            htmlFor={`rule-pattern-${index}`}
+            className="min-w-64 flex-1"
+          >
+            <Input
+              id={`rule-pattern-${index}`}
+              value={rule.pattern}
+              onChange={(event) => update(index, { pattern: event.target.value })}
+              className="font-mono text-mono"
+            />
+          </Field>
+          <Button
+            variant="ghost"
+            onClick={() =>
+              update(index, {
+                verdict: rule.verdict === "rejected" ? "confirmed" : "rejected",
+              })
+            }
+          >
+            {rule.verdict === "rejected" ? ru.filters.ruleAgainst : ru.filters.ruleFor}
+          </Button>
+          <Field
+            label={ru.filters.ruleWindow}
+            htmlFor={`rule-window-${index}`}
+            className="w-40"
+          >
+            <Input
+              id={`rule-window-${index}`}
+              type="number"
+              value={rule.window ?? ""}
+              placeholder={ru.filters.ruleWindowWhole}
+              onChange={(event) =>
+                update(index, {
+                  window: event.target.value ? Number(event.target.value) : null,
+                })
+              }
+            />
+          </Field>
+          <Button
+            variant="ghost"
+            onClick={() => onChange(rules.filter((_, i) => i !== index))}
+            aria-label={ru.common.delete}
+          >
+            ×
+          </Button>
+        </div>
+      ))}
+      <div>
+        <Button
+          variant="secondary"
+          onClick={() =>
+            onChange([
+              ...rules,
+              { name: "", pattern: "", verdict: "rejected", window: 60 },
+            ])
+          }
+        >
+          {ru.filters.addRule}
+        </Button>
+      </div>
+    </div>
+  );
 }

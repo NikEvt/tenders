@@ -23,16 +23,30 @@ class SqlJobTracker:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def start(self, job_id: str, kind: str, total: int) -> None:
+    async def start(
+        self, job_id: str, kind: str, total: int, phase: str | None = None
+    ) -> None:
+        """Начинает задание или **переводит его в следующую фазу**.
+
+        Вставка с обновлением и обнулением `processed` — не оптимизация, а
+        смысл: у новой фазы свой знаменатель, и оставить прежнее число значило
+        бы стартовать её шкалу с чужого места.
+        """
         async with self._session_factory() as session, session.begin():
             statement = pg_insert(Job).values(
-                id=job_id, kind=kind, status="running", total=total, processed=0
+                id=job_id,
+                kind=kind,
+                status="running",
+                phase=phase,
+                total=total,
+                processed=0,
             )
             await session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[Job.id],
                     set_={
                         "status": "running",
+                        "phase": phase,
                         "total": total,
                         "processed": 0,
                         "updated_at": func.now(),
@@ -57,9 +71,24 @@ class SqlJobTracker:
             )
 
     async def fail(self, job_id: str, error: str) -> None:
+        """Помечает задание упавшим.
+
+        Вставка с обновлением, а не UPDATE: падение до того, как отработал
+        `start`, обязано всё равно оставить строку. Иначе экран опрашивает
+        задание, которого нет, и вечное «идёт» превращается в вечную 404.
+        """
+        message = error[:1000]
         async with self._session_factory() as session, session.begin():
+            statement = pg_insert(Job).values(
+                id=job_id, kind="research", status="failed", error_message=message
+            )
             await session.execute(
-                update(Job)
-                .where(Job.id == job_id)
-                .values(status="failed", error=error[:1000], updated_at=func.now())
+                statement.on_conflict_do_update(
+                    index_elements=[Job.id],
+                    set_={
+                        "status": "failed",
+                        "error_message": message,
+                        "updated_at": func.now(),
+                    },
+                )
             )

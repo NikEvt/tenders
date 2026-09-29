@@ -16,7 +16,6 @@ from aio_pika.abc import (
 from libs.shared.contracts.events import EVENT_BY_ROUTING_KEY, RETRY_EXCHANGE, Event
 from libs.shared.logging import get_logger, set_correlation_id
 from libs.shared.messaging.topology import (
-    MAX_RETRY_ATTEMPTS,
     QueueSpec,
     declare_consumer_queues,
 )
@@ -144,7 +143,7 @@ class EventConsumer:
 
     async def _schedule_retry(self, message: AbstractIncomingMessage) -> None:
         attempt = self._attempt(message)
-        if self._retry_exchange is None or attempt >= MAX_RETRY_ATTEMPTS:
+        if self._retry_exchange is None or attempt >= self._spec.max_attempts:
             log.error("event.retries_exhausted", attempts=attempt, queue=self._spec.name)
             await self._to_dead(message)
             return

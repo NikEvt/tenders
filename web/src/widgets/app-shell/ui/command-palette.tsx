@@ -4,7 +4,9 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { Command } from "cmdk";
 import * as RadixDialog from "@radix-ui/react-dialog";
+import { Filter } from "lucide-react";
 import { ru } from "@/shared/i18n/ru";
+import { useSavedFilters } from "@/features/apply-filter/model/use-saved-filters";
 import { useRecentTenders } from "@/shared/lib/recent-tenders";
 import { cn } from "@/shared/lib/cn";
 import { NAV } from "../model/nav";
@@ -25,6 +27,9 @@ export function CommandPalette({
   const router = useRouter();
   const [query, setQuery] = React.useState("");
   const { recent } = useRecentTenders();
+  // Только пока палитра открыта: список фильтров не нужен на каждой холодной
+  // загрузке приложения.
+  const filters = useSavedFilters({ enabled: open });
 
   const go = (href: string, newTab = false) => {
     onOpenChange(false);
@@ -88,6 +93,24 @@ export function CommandPalette({
                   </Item>
                 ))}
               </Command.Group>
+
+              {filters.data && filters.data.length > 0 ? (
+                <Command.Group
+                  heading={ru.keyboard.paletteFilters}
+                  className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-caption [&_[cmdk-group-heading]]:text-text-muted"
+                >
+                  {filters.data.map((item) => (
+                    <Item
+                      key={item.filter_id}
+                      value={item.name}
+                      onSelect={() => go(`/tenders?filter_id=${item.filter_id}`)}
+                    >
+                      <Filter className="h-4 w-4 text-text-muted" strokeWidth={1.5} />
+                      <span className="truncate">{item.name}</span>
+                    </Item>
+                  ))}
+                </Command.Group>
+              ) : null}
 
               {recent.length > 0 ? (
                 <Command.Group

@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, WithJsonSchema
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema
 
 # Pydantic описывает Decimal строковым паттерном с look-ahead, а серверы
 # структурного вывода компилируют схему в грамматику и на look-around падают.
@@ -26,7 +28,38 @@ from pydantic import BaseModel, Field, WithJsonSchema
 Money = Annotated[Decimal | None, WithJsonSchema({"type": ["number", "null"]})]
 
 
-class TermSpec(BaseModel):
+class StrictSchema(BaseModel):
+    """Модель, чья JSON-схема годится для структурного вывода.
+
+    Строгий режим `json_schema` у OpenAI-совместимых серверов требует, чтобы в
+    `required` стояли **все** свойства, а `additionalProperties` был `false`.
+    Pydantic же выводит `required` из отсутствия значения по умолчанию — и у
+    спецификации с разумными умолчаниями он выходит пустым.
+
+    Цена ошибки не косметическая. Сервер отвергает схему целиком, клиент
+    откатывается на «схему в промпте», модель остаётся без грамматики — и на
+    полях с регулярными выражениями вырождается в повтор одного символа, обрывая
+    JSON на середине. Наблюдалось ровно это: `'verdict' is optional`, затем
+    `Invalid JSON: EOF while parsing a string`, затем молчаливый откат
+    компиляции на ключевые слова.
+
+    Умолчания в Python при этом остаются: обязательность объявляется только для
+    модели, которой всё равно нужно заполнить каждое поле.
+    """
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: Any
+    ) -> JsonSchemaValue:
+        schema = super().__get_pydantic_json_schema__(core_schema, handler)
+        schema = handler.resolve_ref_schema(schema)
+        if "properties" in schema:
+            schema["required"] = list(schema["properties"])
+            schema["additionalProperties"] = False
+        return schema
+
+
+class TermSpec(StrictSchema):
     """Термин: что искать в тексте.
 
     `role` решает, значит ли термин что-нибудь сам по себе. Вспомогательный не
@@ -42,7 +75,7 @@ class TermSpec(BaseModel):
     role: Literal["primary", "supporting"] = "primary"
 
 
-class ContextRuleSpec(BaseModel):
+class ContextRuleSpec(StrictSchema):
     """Правило по окружению совпадения.
 
     `window` — сколько символов вокруг совпадения смотреть. У правил отказа он
@@ -57,7 +90,7 @@ class ContextRuleSpec(BaseModel):
     window: int | None = None
 
 
-class StructuralSpec(BaseModel):
+class StructuralSpec(StrictSchema):
     """Дешёвые условия, которые проверяются запросом к базе.
 
     Отделены от терминов намеренно: они не про текст, а про карточку, и стоят
@@ -72,7 +105,7 @@ class StructuralSpec(BaseModel):
     only_active: bool = False
 
 
-class CriteriaSpec(BaseModel):
+class CriteriaSpec(StrictSchema):
     """Полное описание того, что ищут."""
 
     name: str = ""

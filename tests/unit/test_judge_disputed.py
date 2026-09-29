@@ -62,16 +62,16 @@ class FakeModel:
             self.running -= 1
 
 
-class FakeCache:
-    def __init__(self, stored: dict[int, TenderVerdict] | None = None) -> None:
-        self.stored = stored or {}
+class FakeStore:
+    def __init__(self, known: dict[int, TenderVerdict] | None = None) -> None:
+        self.known = known or {}
         self.saved: list[TenderVerdict] = []
 
-    async def cached(self, tender_ids, criteria_version, prompt_version):
-        return {tid: self.stored[tid] for tid in tender_ids if tid in self.stored}
+    async def stored(self, tender_ids, criteria_version, prompt_version):
+        return {tid: self.known[tid] for tid in tender_ids if tid in self.known}
 
-    async def save(self, verdict, criteria_version, prompt_version, model) -> None:
-        self.saved.append(verdict)
+    async def save(self, verdicts, criteria_version, prompt_version, model) -> None:
+        self.saved.extend(verdicts)
 
 
 def candidate(tender_id: int, text: str, **kwargs) -> TenderCandidate:
@@ -219,14 +219,14 @@ class TestEvidenceVerification:
         assert verify_evidence(verdict, hits)[0]["quote"] == hits[0].quote
 
 
-class TestCache:
+class TestStore:
     async def test_cached_verdict_skips_the_model(self) -> None:
-        cached = TenderVerdict(
+        known = TenderVerdict(
             tender_id=3, confidence=Confidence.CONFIRMED, reason="из кэша",
             decided_by="model",
         )
         model = FakeModel()
-        use_case = JudgeDisputedUseCase(CRITERIA, model, cache=FakeCache({3: cached}))
+        use_case = JudgeDisputedUseCase(CRITERIA, model, store=FakeStore({3: known}))
 
         outcome = await use_case.execute([candidate(3, DISPUTED_TEXT)])
 
@@ -235,11 +235,49 @@ class TestCache:
         assert outcome.verdicts[0].reason == "из кэша"
 
     async def test_new_verdicts_are_stored(self) -> None:
-        cache = FakeCache()
-        await JudgeDisputedUseCase(CRITERIA, FakeModel(), cache=cache).execute(
+        store = FakeStore()
+        await JudgeDisputedUseCase(CRITERIA, FakeModel(), store=store).execute(
             [candidate(3, DISPUTED_TEXT)]
         )
-        assert [v.tender_id for v in cache.saved] == [3]
+        assert [v.tender_id for v in store.saved] == [3]
+
+    async def test_verdicts_of_the_rules_are_stored_too(self) -> None:
+        """Отбор каталога читает эту таблицу, а правила решают большинство."""
+        store = FakeStore()
+        await JudgeDisputedUseCase(CRITERIA, FakeModel(), store=store).execute(
+            [
+                candidate(1, CONFIRMED_TEXT),
+                candidate(2, REJECTED_TEXT),
+                candidate(3, DISPUTED_TEXT),
+            ]
+        )
+
+        assert {v.tender_id for v in store.saved} == {1, 2, 3}
+        assert sorted(v.decided_by for v in store.saved) == ["model", "rules", "rules"]
+
+    async def test_a_run_without_disputes_still_stores(self) -> None:
+        """Ранний возврат не должен уносить с собой решения правил."""
+        store = FakeStore()
+        outcome = await JudgeDisputedUseCase(CRITERIA, FakeModel(), store=store).execute(
+            [candidate(1, CONFIRMED_TEXT), candidate(2, REJECTED_TEXT)]
+        )
+
+        assert outcome.funnel.disputed == 0
+        assert {v.tender_id for v in store.saved} == {1, 2}
+
+    async def test_dry_run_leaves_no_trace(self) -> None:
+        """Пробный прогон считает воронку, но не пачкает отбор каталога."""
+        store = FakeStore()
+        outcome = await JudgeDisputedUseCase(
+            CRITERIA, FakeModel(), store=store, dry_run=True
+        ).execute(
+            [candidate(1, CONFIRMED_TEXT), candidate(3, DISPUTED_TEXT)]
+        )
+
+        assert store.saved == []
+        # Воронка при этом полноценная — ради неё тест и запускают.
+        assert outcome.funnel.total == 2
+        assert outcome.funnel.confirmed_by_rules == 1
 
 
 class TestModelOutage:
@@ -258,15 +296,15 @@ class TestModelOutage:
         assert outcome.funnel.not_reached > 0
 
     async def test_verdicts_made_before_the_outage_survive(self) -> None:
-        cache = FakeCache()
+        store = FakeStore()
         model = FakeModel(unavailable_after=2)
-        use_case = JudgeDisputedUseCase(CRITERIA, model, cache=cache, concurrency=1)
+        use_case = JudgeDisputedUseCase(CRITERIA, model, store=store, concurrency=1)
 
         outcome = await use_case.execute(
             [candidate(i, DISPUTED_TEXT) for i in range(1, 8)]
         )
 
-        assert len(cache.saved) == 2
+        assert len(store.saved) == 2
         assert len([v for v in outcome.verdicts if v.decided_by == "model"]) == 2
 
     async def test_one_broken_answer_does_not_stop_the_rest(self) -> None:
@@ -357,3 +395,83 @@ class TestOnTheLabelledSet:
             self.candidates(golden, "confirmed") + self.candidates(golden, "rejected")
         )
         assert len(model.prompts) <= 12
+
+
+class FakeProgress:
+    """Порт прогресса, который помнит все доклады."""
+
+    def __init__(self, breaks: bool = False) -> None:
+        self.reports: list[tuple[int, int]] = []
+        self.breaks = breaks
+
+    async def report(self, processed: int, total: int) -> None:
+        if self.breaks:
+            raise RuntimeError("база недоступна")
+        self.reports.append((processed, total))
+
+
+class TestProgress:
+    """Судья — самая долгая фаза прогона, и она обязана быть видна.
+
+    Пока докладов не было, шкала доходила до конца обхода корпуса и стояла там
+    минуты: то есть утверждала, что прогон закончен, посреди работы модели.
+    """
+
+    async def test_every_candidate_is_reported(self) -> None:
+        progress = FakeProgress()
+        await JudgeDisputedUseCase(
+            CRITERIA, FakeModel(), concurrency=1, progress=progress
+        ).execute([candidate(i, DISPUTED_TEXT) for i in range(1, 6)])
+
+        # Открывающий доклад плюс по одному на закупку.
+        assert progress.reports == [(0, 5), (1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]
+
+    async def test_the_opening_report_precedes_the_first_answer(self) -> None:
+        """Фаза переключается до первого обращения к модели, а не после.
+
+        Иначе экран показывал бы законченный обход корпуса всё то время, пока
+        не вернётся первый вердикт, — а это минута и больше.
+        """
+        progress = FakeProgress()
+        model = FakeModel()
+        model.delay = 0.01
+        await JudgeDisputedUseCase(
+            CRITERIA, model, concurrency=1, progress=progress
+        ).execute([candidate(1, DISPUTED_TEXT)])
+
+        assert progress.reports[0] == (0, 1)
+
+    async def test_progress_climbs_without_gaps(self) -> None:
+        progress = FakeProgress()
+        await JudgeDisputedUseCase(
+            CRITERIA, FakeModel(), concurrency=4, progress=progress
+        ).execute([candidate(i, DISPUTED_TEXT) for i in range(1, 13)])
+
+        processed = [p for p, _ in progress.reports]
+        assert processed == list(range(0, 13))
+
+    async def test_failures_are_counted_as_progress_too(self) -> None:
+        """Сбой на закупке — тоже пройденный шаг: полоса не имеет права встать."""
+        progress = FakeProgress()
+        outcome = await JudgeDisputedUseCase(
+            CRITERIA, FakeModel(fail_on={1}), concurrency=1, progress=progress
+        ).execute([candidate(i, DISPUTED_TEXT) for i in range(1, 4)])
+
+        assert outcome.funnel.failed == 1
+        assert progress.reports[-1] == (3, 3)
+
+    async def test_a_broken_tracker_does_not_sink_the_run(self) -> None:
+        """Инвариант 5: вспомогательное не роняет основное."""
+        outcome = await JudgeDisputedUseCase(
+            CRITERIA, FakeModel(), concurrency=1, progress=FakeProgress(breaks=True)
+        ).execute([candidate(i, DISPUTED_TEXT) for i in range(1, 4)])
+
+        assert outcome.funnel.asked_model == 3
+
+    async def test_progress_is_optional(self) -> None:
+        """Старые вызовы без порта остаются валидными."""
+        outcome = await JudgeDisputedUseCase(CRITERIA, FakeModel()).execute(
+            [candidate(1, DISPUTED_TEXT)]
+        )
+
+        assert outcome.funnel.asked_model == 1

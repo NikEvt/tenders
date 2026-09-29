@@ -151,6 +151,28 @@ class TenderCandidate:
 
 
 @dataclass(slots=True)
+class DigestScope:
+    """По каким закупкам собрана сводка.
+
+    Обязательная часть материала, а не пометка: «за день 16 закупок» означает
+    совершенно разное, когда это весь день и когда это отбор по двум фильтрам.
+    Раньше сводка молча брала всё подряд, а тумблер «включать в сводку» на
+    карточке фильтра не был подключён ни к чему.
+    """
+
+    #: Названия фильтров, по которым шёл отбор. Пусто — отбора не было.
+    filters: list[str] = field(default_factory=list)
+    #: Фильтры, включённые в сводку, но ни разу не прогнанные. У них нет
+    #: вердиктов, поэтому они не приносят ни одной закупки — и молчать об этом
+    #: нельзя: пустая сводка выглядела бы выводом о рынке.
+    unrun_filters: list[str] = field(default_factory=list)
+
+    @property
+    def filtered(self) -> bool:
+        return bool(self.filters)
+
+
+@dataclass(slots=True)
 class DigestInput:
     """Материал для ежедневной сводки."""
 
@@ -161,3 +183,4 @@ class DigestInput:
     clusters: dict[str, list[TenderCandidate]]
     deadline_changes: list[TenderCandidate]
     new_customers: list[str]
+    scope: DigestScope = field(default_factory=DigestScope)

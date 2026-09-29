@@ -68,3 +68,15 @@ class CrawlRunnerPort(ABC):
 
     @abstractmethod
     async def run(self, request: CrawlRequest) -> CrawlResult: ...
+
+
+class CrawlProgressPort(ABC):
+    """Куда сообщать, как далеко зашла выгрузка периода.
+
+    Заявка на сотню дней по восьмидесяти пяти регионам идёт часами. Без чисел
+    экран показывал бы бесконечный волчок — то есть был бы неотличим от
+    зависшего.
+    """
+
+    @abstractmethod
+    async def report(self, processed: int, total: int) -> None: ...

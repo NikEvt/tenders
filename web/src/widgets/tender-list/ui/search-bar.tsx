@@ -8,7 +8,7 @@ import { Chip } from "@/shared/ui/chip";
 import { ru } from "@/shared/i18n/ru";
 import { cn } from "@/shared/lib/cn";
 import { commandPalette } from "@/shared/lib/command-palette";
-import type { FilterSpec } from "@/shared/api/types";
+import type { CriteriaSpec } from "@/shared/api/types";
 import { useCompileFilter } from "@/features/compile-filter/model/use-compile-filter";
 import { compiledConditions } from "@/features/compile-filter/ui/compiled-chips";
 
@@ -18,7 +18,7 @@ export type SearchBarProps = {
   /** Простой поиск без обращения к модели: Enter при пустом разборе. */
   onSubmit: (value: string) => void;
   /** Разобранная моделью спецификация принята пользователем. */
-  onApplySpec: (spec: FilterSpec) => void;
+  onApplySpec: (spec: CriteriaSpec) => void;
   inputRef?: React.RefObject<HTMLInputElement | null>;
 };
 
@@ -38,7 +38,7 @@ export function SearchBar({
   inputRef,
 }: SearchBarProps) {
   const compile = useCompileFilter();
-  const [draft, setDraft] = React.useState<FilterSpec | null>(null);
+  const [draft, setDraft] = React.useState<CriteriaSpec | null>(null);
   const [text, setText] = React.useState(value);
 
   React.useEffect(() => setText(value), [value]);
@@ -141,8 +141,8 @@ function CompiledDraft({
   onApply,
   onDiscard,
 }: {
-  spec: FilterSpec;
-  onChange: (spec: FilterSpec) => void;
+  spec: CriteriaSpec;
+  onChange: (spec: CriteriaSpec) => void;
   onApply: () => void;
   onDiscard: () => void;
 }) {
@@ -165,7 +165,7 @@ function CompiledDraft({
             <li key={condition.id} className="max-w-full">
               <Chip
                 kind={condition.kind}
-                title={condition.kind === "llm" ? ru.filters.stepJudge : condition.label}
+                title={condition.kind === "rule" ? ru.filters.stepTell : condition.label}
                 onRemove={() => onChange(condition.remove(spec))}
               >
                 {condition.label}
@@ -182,9 +182,11 @@ function CompiledDraft({
         <Button size="sm" variant="ghost" onClick={onDiscard}>
           {ru.common.cancel}
         </Button>
-        {spec.llm_criteria?.trim() ? (
+        {spec.context_rules?.length || spec.terms?.some((t) => t.role === "supporting") ? (
           <p className="ml-auto text-body-sm text-text-muted">
-            Критерий для судьи заработает после сохранения фильтра.
+            {/* Каталог ищет по карточке; термины и правила работают по тексту
+                документов — они заработают после сохранения и прогона. */}
+            Правила по контексту заработают после сохранения фильтра.
           </p>
         ) : null}
       </div>

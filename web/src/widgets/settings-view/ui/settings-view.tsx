@@ -9,6 +9,7 @@ import { SectionHeading } from "@/shared/ui/section";
 import { TextSkeleton } from "@/shared/ui/skeleton";
 import { useToast } from "@/shared/ui/toast";
 import { endpoints } from "@/shared/api/endpoints";
+import { LoadLevelControl } from "./load-level";
 import { STALE } from "@/shared/api/query-keys";
 import type { Settings } from "@/shared/api/types";
 import { dateLong } from "@/shared/lib/format";
@@ -51,6 +52,8 @@ export function SettingsView() {
 
   return (
     <div className="flex flex-col gap-6">
+      <LoadLevelControl />
+
       {data.restart_required_keys.length ? (
         <Banner
           tone="oak"

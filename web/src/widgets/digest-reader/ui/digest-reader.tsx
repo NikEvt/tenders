@@ -4,8 +4,9 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, Printer } from "lucide-react";
+import { ChevronLeft, ChevronRight, Printer, RefreshCw } from "lucide-react";
 import { Button } from "@/shared/ui/button";
+import { Dialog, DialogContent } from "@/shared/ui/dialog";
 import { Card } from "@/shared/ui/card";
 import { Markdown } from "@/shared/ui/markdown";
 import { PageHeader, SectionHeading } from "@/shared/ui/section";
@@ -15,15 +16,24 @@ import { Rail } from "@/shared/ui/rail/rail";
 import { CopyableMono } from "@/shared/ui/mono";
 import { ru } from "@/shared/i18n/ru";
 import { cn } from "@/shared/lib/cn";
-import { dateLong, dateShort, dateWeekday, isoDate, money, toDate } from "@/shared/lib/format";
+import {
+  dateLong,
+  dateShort,
+  dateWeekday,
+  isoDate,
+  money,
+  timeOnly,
+  toDate,
+} from "@/shared/lib/format";
 import { formatCount, withPlural } from "@/shared/lib/plural";
 import { useFirstVisitToday } from "@/shared/lib/hooks";
 import { endpoints } from "@/shared/api/endpoints";
+import { jobRegistry } from "@/shared/api/job-registry";
 import { qk, STALE } from "@/shared/api/query-keys";
 import { ApiError } from "@/shared/api/client";
 import type { Digest } from "@/shared/api/types";
 import { useJob } from "@/shared/api/use-job";
-import { PendingBlock } from "@/features/async-job/ui/pending-block";
+import { PendingBlock } from "@/shared/ui/pending-block";
 
 /**
  * Сводка дня — первое, что видит аналитик утром.
@@ -49,17 +59,31 @@ export function DigestReader({ date }: { date: string }) {
   const [jobId, setJobId] = React.useState<string | null>(null);
   const job = useJob(jobId);
 
+  const [confirming, setConfirming] = React.useState(false);
+
   React.useEffect(() => {
     if (job.data?.status === "done") {
       setJobId(null);
       void client.invalidateQueries({ queryKey: qk.digest(date) });
+      // Лента дат тоже меняется: собранный задним числом день должен в ней
+      // появиться, иначе стрелки продолжают вести вслепую.
+      void client.invalidateQueries({ queryKey: ["digest", "dates"] });
     }
   }, [job.data?.status, client, date]);
 
   const build = useMutation({
-    mutationFn: () => endpoints.requestDigest(date, false),
-    onSuccess: (result) => setJobId(result.job_id),
+    mutationFn: (force: boolean) => endpoints.requestDigest(date, force),
+    onSuccess: (result) => {
+      setJobId(result.job_id);
+      jobRegistry.track({
+        jobId: result.job_id,
+        title: ru.digest.rebuilding,
+        href: date === today ? "/" : `/digest/${date}`,
+      });
+    },
   });
+
+  const rebuilding = build.isPending || Boolean(jobId);
 
   const shift = (days: number) => {
     const next = new Date(`${date}T00:00:00`);
@@ -133,6 +157,17 @@ export function DigestReader({ date }: { date: string }) {
             >
               {ru.common.print}
             </Button>
+            {digest.data ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<RefreshCw className="h-4 w-4" strokeWidth={1.5} />}
+                onClick={() => setConfirming(true)}
+                disabled={rebuilding}
+              >
+                {ru.digest.rebuild}
+              </Button>
+            ) : null}
           </>
         }
       >
@@ -141,6 +176,11 @@ export function DigestReader({ date }: { date: string }) {
 
       <AvailableDates dates={available.data?.dates ?? []} current={date} today={today} />
 
+      {/* Честность двумя строками: за какой круг закупок собрана сводка и
+          можно ли считать её итогом дня. Без первой число закупок — величина
+          без основания; без второй черновик неотличим от окончательной. */}
+      {digest.data ? <Provenance digest={digest.data} /> : null}
+
       {digest.isLoading ? (
         <TextSkeleton lines={5} />
       ) : notFound ? (
@@ -148,12 +188,22 @@ export function DigestReader({ date }: { date: string }) {
           isToday={isToday}
           date={date}
           job={job.data}
-          pending={build.isPending || Boolean(jobId)}
+          pending={rebuilding}
           error={build.error?.message ?? null}
-          onBuild={() => build.mutate()}
+          onBuild={() => build.mutate(false)}
         />
       ) : digest.data ? (
         <>
+          {/* Старый документ остаётся на месте: исчезнувшая на три минуты
+              сводка хуже той, которую видно заменяемой. */}
+          {rebuilding ? (
+            <PendingBlock
+              title={ru.digest.rebuilding}
+              job={job.data}
+              error={build.error?.message ?? null}
+            />
+          ) : null}
+
           <VellumNote
             eyebrow={ru.digest.title.toUpperCase()}
             source={digest.data.model}
@@ -236,6 +286,31 @@ export function DigestReader({ date }: { date: string }) {
           ) : null}
         </>
       ) : null}
+
+      {/* Пересборка заменяет существующий документ и идёт минутами — это стоит
+          подтверждения. Диалог, а не window.confirm: тот блокирует поток, не
+          темизуется и обходит дисциплину ru.ts. */}
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent
+          title={ru.digest.rebuildTitle}
+          description={ru.digest.rebuildBody(dateLong(date))}
+        >
+          <div className="mt-6 flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setConfirming(false)}>
+              {ru.common.cancel}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                setConfirming(false);
+                build.mutate(true);
+              }}
+            >
+              {ru.digest.rebuildConfirm}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </article>
   );
 }
@@ -327,6 +402,52 @@ function recentWindow(today: string): { from: string; to: string } {
  * ссылке есть что читать. Дни без сводки сюда не попадают, и клиент не зовёт
  * пользователя в пустоту.
  */
+/**
+ * Происхождение сводки: область отбора и её завершённость.
+ *
+ * Стоит над текстом, а не под ним: это рамка, в которой читается всё
+ * остальное. Сводка за идущий день описывает столько, сколько успело доехать,
+ * и молчаливо выдавать её за итог дня нельзя.
+ */
+function Provenance({ digest }: { digest: Digest }) {
+  const scope = digest.sections?.scope;
+
+  return (
+    <div className="flex flex-col gap-1 text-body-sm">
+      <p className="flex flex-wrap items-center gap-x-2 text-text-muted">
+        {digest.final ? null : (
+          <span className="surface-oak-tint rounded-full px-2 py-0.5 text-caption">
+            {ru.digest.draft}
+          </span>
+        )}
+        <span>
+          {digest.final
+            ? ru.digest.finalHint(dateShort(digest.digest_date))
+            : ru.digest.draftHint(timeOnly(digest.generated_at))}
+        </span>
+      </p>
+
+      <p className="flex flex-wrap items-center gap-x-2 text-text-muted">
+        <span>
+          {scope?.filtered
+            ? ru.digest.scopeFilters(scope.filters.join(", "))
+            : ru.digest.scopeAll}
+        </span>
+        <Link href="/filters" className="text-gos-fg hover:underline">
+          {ru.digest.scopeEdit}
+        </Link>
+      </p>
+
+      {scope?.unrun_filters?.length ? (
+        <p role="alert" className="text-body-sm text-oak-fg">
+          {ru.digest.scopeUnrun(scope.unrun_filters.join(", "))}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+
 function AvailableDates({
   dates,
   current,

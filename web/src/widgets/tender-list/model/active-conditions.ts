@@ -9,8 +9,16 @@ export type ActiveCondition = {
   clear: Partial<CatalogParams>;
 };
 
+export type ConditionLabels = {
+  /** Имя сохранённого фильтра. Пока список фильтров едет — не известно. */
+  filterName?: string | null;
+};
+
 /** Каждое применённое условие — снимаемый чип. Скрытых условий не бывает. */
-export function activeConditions(params: CatalogParams): ActiveCondition[] {
+export function activeConditions(
+  params: CatalogParams,
+  labels: ConditionLabels = {},
+): ActiveCondition[] {
   const items: ActiveCondition[] = [];
 
   if (params.q) {
@@ -89,10 +97,24 @@ export function activeConditions(params: CatalogParams): ActiveCondition[] {
   if (params.filter_id !== null) {
     items.push({
       id: "filter_id",
-      label: `${ru.nav.filters}: #${params.filter_id}`,
-      clear: { filter_id: null, page: 0 },
+      // Имя, а не номер: «Фильтры: #7» не говорит, что именно применено.
+      label: `${ru.catalog.filter.label}: ${labels.filterName ?? `#${params.filter_id}`}`,
+      clear: { filter_id: null, filter_verdict: "confirmed", page: 0 },
     });
+    if (params.filter_verdict !== "confirmed") {
+      items.push({
+        id: "filter_verdict",
+        label: ru.catalog.filter.chipVerdict(verdictLabel(params.filter_verdict)),
+        clear: { filter_verdict: "confirmed", page: 0 },
+      });
+    }
   }
 
   return items;
+}
+
+function verdictLabel(verdict: string): string {
+  if (verdict === "rejected") return ru.catalog.filter.verdictRejected;
+  if (verdict === "disputed") return ru.catalog.filter.verdictDisputed;
+  return ru.catalog.filter.verdictConfirmed;
 }

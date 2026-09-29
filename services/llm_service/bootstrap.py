@@ -25,6 +25,7 @@ from services.llm_service.application.use_cases.manage_filters import ManageFilt
 from services.llm_service.infrastructure.db.repositories import (
     SqlDigestRepository,
     SqlFilterRepository,
+    SqlJobTracker,
 )
 from services.llm_service.infrastructure.llm.openai_client import OpenAiCompatibleLlm
 
@@ -41,6 +42,7 @@ class LlmContainer:
     generate_digest: GenerateDigestUseCase
     filters: SqlFilterRepository
     digests: SqlDigestRepository
+    jobs: SqlJobTracker
     #: Модель напрямую: по ней работает `/judge`, которым пользуется движок
     #: отбора. Отбор кандидатов и вердикты живут теперь там, а здесь остаётся
     #: то, ради чего сервис и заводился, — доступ к модели.
@@ -66,6 +68,7 @@ async def build_container(
 
     filters = SqlFilterRepository(session_factory)
     digests = SqlDigestRepository(session_factory)
+    jobs = SqlJobTracker(session_factory)
     container = LlmContainer(
         engine=engine,
         session_factory=session_factory,
@@ -74,11 +77,12 @@ async def build_container(
         embedder=embedder,
         compile_filter=CompileFilterUseCase(llm, filters),
         manage_filters=ManageFiltersUseCase(filters),
-        generate_digest=GenerateDigestUseCase(llm, digests),
+        generate_digest=GenerateDigestUseCase(llm, digests, jobs),
         llm=llm,
         judge_reasoning_effort=llm_settings.judge_reasoning_effort,
         filters=filters,
         digests=digests,
+        jobs=jobs,
         model_name=llm.model_name,
     )
 

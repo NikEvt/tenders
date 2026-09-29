@@ -174,8 +174,8 @@ function Primitives() {
 
       <div className="flex flex-wrap gap-2">
         <Chip kind="structural">регион: Москва</Chip>
-        <Chip kind="semantic">«ремонт кровли»</Chip>
-        <Chip kind="llm">критерий судьи</Chip>
+        <Chip kind="term">термин «ХПК»</Chip>
+        <Chip kind="rule">правило: название объекта</Chip>
       </div>
 
       <div className="rounded-[10px] border border-hairline bg-surface p-3">

@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
@@ -233,6 +234,16 @@ class DocumentChunk(Base):
         ),
         Index("document_chunks_tsv_idx", "search_tsv", postgresql_using="gin"),
         Index("document_chunks_document_order_idx", "document_id", "chunk_index"),
+        # Счётчик векторизованных фрагментов для вкладки «Данные». Без него
+        # число, лежащее в двадцати тысячах строк, стоило двух секунд
+        # последовательного чтения двух миллионов — а опрашивается оно раз в
+        # пятнадцать секунд. Частичный: полный индекс по колонке векторов был
+        # бы размером с таблицу.
+        Index(
+            "document_chunks_embedded_idx",
+            "id",
+            postgresql_where=text("embedding IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -421,6 +432,13 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     kind: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(16), server_default="queued", index=True)
+    #: Какой этап операции идёт сейчас: «обход корпуса», «судья читает
+    #: документы». Долгие операции состоят из фаз с разной ценой единицы
+    #: работы, и `processed`/`total` считаются **внутри фазы** — сквозной
+    #: процент по разнородным фазам был бы выдуманным числом. Без имени фазы
+    #: шкала, дошедшая до конца обхода, выглядела бы завершённой посреди
+    #: работы судьи.
+    phase: Mapped[str | None] = mapped_column(String(64))
     total: Mapped[int] = mapped_column(Integer, server_default="0")
     processed: Mapped[int] = mapped_column(Integer, server_default="0")
     result: Mapped[dict | None] = mapped_column(JSONB)

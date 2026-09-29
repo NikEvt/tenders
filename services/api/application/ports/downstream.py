@@ -32,7 +32,11 @@ class LlmServicePort(ABC):
 
     @abstractmethod
     async def run_filter(
-        self, filter_id: int, since: date | None, tender_ids: list[int]
+        self,
+        filter_id: int,
+        since: date | None,
+        until: date | None,
+        regions: list[str],
     ) -> dict: ...
 
     @abstractmethod

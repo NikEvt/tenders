@@ -1,0 +1,318 @@
+# Поставка клиенту: тот же стек, что и в docker-compose.yml, но собирать нечего —
+# образы приезжают архивом и загружаются `docker load`. Отсюда три отличия:
+#
+# 1. `image:` вместо `build:` — на машине клиента нет ни исходников, ни компилятора.
+# 2. Нет embedding-service: torch и модель на 2 ГБ в поставку не входят. Фильтры,
+#    сводка, research и краулер эмбеддингов не требуют; поиск по документам без
+#    них вырождается в лексический (API это умеет, см. search_repository.py).
+# 3. Порты слушают только 127.0.0.1. У клиента это рабочая машина в офисной сети,
+#    и RabbitMQ с паролем по умолчанию наружу светить незачем.
+#
+# Данных здесь нет: тома пустые, схему накатывает migrate, бакет создаёт
+# createbuckets. Первый запуск поднимает чистую систему.
+
+name: zakupki
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-zakupki}
+  POSTGRES_USER: ${POSTGRES_USER:-zakupki}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD не задан — запустите start.bat, он создаст .env}
+
+x-mq-env: &mq-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_USER: ${RABBITMQ_USER:-zakupki}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD не задан — запустите start.bat}
+
+x-minio-env: &minio-env
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zakupki}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD не задан — запустите start.bat}
+  MINIO_BUCKET: ${MINIO_BUCKET:-tender-documents}
+  MINIO_SECURE: "false"
+
+x-log-env: &log-env
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: ${LOG_JSON:-true}
+
+# ─── Бюджет памяти ────────────────────────────────────────────────────────────
+# Без embedding-service сумма потолков — 6.1 ГиБ. WSL2 по умолчанию отдаёт Docker
+# половину памяти хоста, поэтому 16 ГБ на машине клиента — комфортный минимум,
+# 8 ГБ — предел, при котором нужен .wslconfig (см. README).
+x-limits-worker: &limits-worker
+  deploy:
+    resources:
+      limits: { memory: 1536m }
+
+x-limits-db: &limits-db
+  deploy:
+    resources:
+      limits: { memory: 1024m }
+
+x-limits-broker: &limits-broker
+  deploy:
+    resources:
+      limits: { memory: 512m }
+
+x-limits-storage: &limits-storage
+  deploy:
+    resources:
+      limits: { memory: 320m }
+
+x-limits-gateway: &limits-gateway
+  deploy:
+    resources:
+      limits: { memory: 448m }
+
+x-limits-ui: &limits-ui
+  deploy:
+    resources:
+      limits: { memory: 448m }
+
+x-limits-small: &limits-small
+  deploy:
+    resources:
+      limits: { memory: 256m }
+
+x-limits-crawler: &limits-crawler
+  deploy:
+    resources:
+      limits: { memory: 1g }
+
+x-threads-worker: &threads-worker
+  OMP_NUM_THREADS: "2"
+  OMP_THREAD_LIMIT: "2"
+  OPENBLAS_NUM_THREADS: "2"
+
+x-infra-ready: &infra-ready
+  postgres:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+services:
+  # ─── Инфраструктура ─────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: *limits-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zakupki}
+      POSTGRES_USER: ${POSTGRES_USER:-zakupki}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD не задан}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zakupki} -d ${POSTGRES_DB:-zakupki}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    <<: *limits-broker
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-zakupki}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD не задан}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      # На холодном старте под WSL2 нода Erlang поднимается медленнее, чем на
+      # Linux-хосте: окно оставлено с запасом, иначе зависимые сервисы падают.
+      start_period: 180s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    <<: *limits-storage
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zakupki}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD не задан}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-zakupki} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-tender-documents} &&
+      echo 'bucket ready'
+      "
+    restart: "no"
+
+  # ─── Миграции: должны отработать до старта сервисов ─────────────────────────
+  migrate:
+    image: zakupki-migrate:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан — возьмите .env из поставки}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: [*db-env, *log-env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── Прикладные сервисы ─────────────────────────────────────────────────────
+  crawler:
+    image: zakupki-crawler:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command: ["python", "-m", "services.crawler"]
+    <<: *limits-crawler
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+      EIS_TOKEN: ${EIS_TOKEN:?EIS_TOKEN не задан — впишите токен ЕИС в .env}
+      EIS_REGIONS: ${EIS_REGIONS:-77}
+      EIS_DOCUMENT_TYPES: ${EIS_DOCUMENT_TYPES:-epNotificationEF2020}
+      EIS_CRAWL_INTERVAL_MINUTES: ${EIS_CRAWL_INTERVAL_MINUTES:-60}
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  docs-worker:
+    image: zakupki-docs:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command: ["python", "-m", "services.docs_worker"]
+    <<: *limits-worker
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env, *threads-worker]
+      EIS_TOKEN: ${EIS_TOKEN:?EIS_TOKEN не задан}
+      # Событие embedding.requested воркер публикует по-прежнему. Потребителя у
+      # него в этой поставке нет, очередь не объявлена — сообщение отбрасывается
+      # обменником. Так задел на эмбеддинги остаётся, а брокер не пухнет.
+      DOCS_WORKER_PREFETCH: ${DOCS_WORKER_PREFETCH:-}
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  llm-service:
+    image: zakupki-llm:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command:
+      ["uvicorn", "services.llm_service.presentation.app:app",
+       "--host", "0.0.0.0", "--port", "8010"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+      LLM_BASE_URL: ${LLM_BASE_URL:?LLM_BASE_URL не задан}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY не задан — впишите свой ключ в .env}
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL не задан}
+      LLM_AUTH_SCHEME: ${LLM_AUTH_SCHEME:-Api-Key}
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-4}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-none}
+      LLM_JUDGE_REASONING_EFFORT: ${LLM_JUDGE_REASONING_EFFORT:-low}
+    ports:
+      - "127.0.0.1:8010:8010"
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Движок отбора: находит упоминания по накопленному тексту, спорные случаи
+  # отдаёт модели через llm-service. Своей модели не имеет.
+  research:
+    image: zakupki-api:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command: ["python", "-m", "services.research"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env]
+      LLM_SERVICE_URL: http://llm-service:8010
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL не задан}
+      LOAD_LEVEL: ${LOAD_LEVEL:-2}
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Рекомендации остаются в поставке ради целостности API и интерфейса: без
+  # эмбеддингов персонализации не будет, выдача остаётся неперсональной.
+  recsys-service:
+    image: zakupki-recsys:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command:
+      ["uvicorn", "services.recsys_service.presentation.app:app",
+       "--host", "0.0.0.0", "--port", "8030"]
+    <<: *limits-small
+    environment:
+      <<: [*db-env, *mq-env, *log-env]
+    depends_on:
+      <<: *infra-ready
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api:
+    image: zakupki-api:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    command:
+      ["uvicorn", "services.api.main:app",
+       "--host", "0.0.0.0", "--port", "8000"]
+    <<: *limits-gateway
+    environment:
+      <<: [*db-env, *mq-env, *minio-env, *log-env]
+      RABBITMQ_MANAGEMENT_PORT: ${RABBITMQ_MANAGEMENT_PORT:-15672}
+      EIS_TOKEN: ${EIS_TOKEN:?EIS_TOKEN не задан}
+      LLM_SERVICE_URL: http://llm-service:8010
+      RECSYS_SERVICE_URL: http://recsys-service:8030
+      # Адрес несуществующего сервиса оставлен намеренно: на странице мониторинга
+      # embedding-service честно горит `down`, а поиск по документам платит за
+      # три попытки подключения и деградирует до лексического.
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding-service:8020}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      <<: *infra-ready
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    # Адрес API вшит в бандл на сборке (NEXT_PUBLIC_API_URL). Менять WEB_API_URL
+    # в .env бессмысленно — нужна пересборка образа на стороне поставщика.
+    image: zakupki-web:${ZAKUPKI_TAG:?ZAKUPKI_TAG не задан}
+    <<: *limits-ui
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  miniodata:

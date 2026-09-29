@@ -24,7 +24,7 @@ from services.research.infrastructure.repositories import (
     SqlCorpusRepository,
     SqlHitRepository,
     SqlResearchRunRepository,
-    SqlVerdictCache,
+    SqlVerdictStore,
 )
 
 PREFIX = "TEST-RESEARCH-"
@@ -109,21 +109,20 @@ class TestCorpus:
         assert found[0].okpd2_codes == ("71.20.11",)
 
     @pytest.mark.asyncio
-    async def test_only_documents_with_text_are_returned(
+    async def test_documents_without_text_come_back_too(
         self, session_factory, corpus
     ) -> None:
-        """Читать нечего там, где текст не извлечён."""
+        """Неразобранный документ — это знаменатель, и он обязан доехать до обхода.
+
+        Раньше запрос отсекал такие соединением, а знаменатель считался
+        отдельно по всему корпусу — то есть по другой популяции, чем числитель.
+        """
         documents = await SqlCorpusRepository(session_factory).documents(corpus["water"])
 
-        assert [d.text_key for d in documents] == ["texts/aa/water.txt"]
-
-    @pytest.mark.asyncio
-    async def test_unscanned_documents_are_counted(self, session_factory, corpus) -> None:
-        """Знаменатель: без него «находок нет» ничего не значит."""
-        count = await SqlCorpusRepository(session_factory).count_unscanned(
-            ["77"], None, None
-        )
-        assert count >= 1
+        assert sorted(d.file_name for d in documents) == ["ТЗ.docx", "скан.pdf"]
+        assert [d.text_key for d in documents if d.text_key] == ["texts/aa/water.txt"]
+        # Нечитаемый приезжает с пустым ключом — по нему проход и считает пропуск.
+        assert any(d.text_key is None for d in documents)
 
 
 class TestHits:
@@ -173,10 +172,10 @@ class TestRuns:
             await session.execute(delete(ResearchRun).where(ResearchRun.id == run_id))
 
 
-class TestVerdictCache:
+class TestVerdictStore:
     @pytest.mark.asyncio
     async def test_verdict_survives_a_round_trip(self, session_factory, corpus) -> None:
-        cache = SqlVerdictCache(session_factory)
+        store = SqlVerdictStore(session_factory)
         verdict = TenderVerdict(
             tender_id=corpus["water"],
             confidence=Confidence.CONFIRMED,
@@ -186,8 +185,8 @@ class TestVerdictCache:
             evidence=[{"hit_number": 1, "quote": "БПК5"}],
         )
 
-        await cache.save(verdict, CRITERIA.version, JUDGE_PROMPT_VERSION, "test-model")
-        found = await cache.cached(
+        await store.save([verdict], CRITERIA.version, JUDGE_PROMPT_VERSION, "test-model")
+        found = await store.stored(
             [corpus["water"]], CRITERIA.version, JUDGE_PROMPT_VERSION
         )
 
@@ -201,17 +200,19 @@ class TestVerdictCache:
         self, session_factory, corpus
     ) -> None:
         """Правка шаблонов обязана обесценить прежние решения, а не смешаться с ними."""
-        cache = SqlVerdictCache(session_factory)
-        await cache.save(
-            TenderVerdict(
-                tender_id=corpus["water"], confidence=Confidence.CONFIRMED, reason="x"
-            ),
+        store = SqlVerdictStore(session_factory)
+        await store.save(
+            [
+                TenderVerdict(
+                    tender_id=corpus["water"], confidence=Confidence.CONFIRMED, reason="x"
+                )
+            ],
             "хпк-бпк-v2",
             JUDGE_PROMPT_VERSION,
             "test-model",
         )
 
-        assert await cache.cached([corpus["water"]], "хпк-бпк-v3", JUDGE_PROMPT_VERSION) == {}
+        assert await store.stored([corpus["water"]], "хпк-бпк-v3", JUDGE_PROMPT_VERSION) == {}
 
         await _clear(session_factory, corpus["water"])
 
@@ -219,23 +220,80 @@ class TestVerdictCache:
     async def test_saving_twice_updates_instead_of_duplicating(
         self, session_factory, corpus
     ) -> None:
-        cache = SqlVerdictCache(session_factory)
+        store = SqlVerdictStore(session_factory)
         for reason in ("первое", "второе"):
-            await cache.save(
-                TenderVerdict(
-                    tender_id=corpus["water"],
-                    confidence=Confidence.REJECTED,
-                    reason=reason,
-                ),
+            await store.save(
+                [
+                    TenderVerdict(
+                        tender_id=corpus["water"],
+                        confidence=Confidence.REJECTED,
+                        reason=reason,
+                    )
+                ],
                 CRITERIA.version,
                 JUDGE_PROMPT_VERSION,
                 "test-model",
             )
 
-        found = await cache.cached(
+        found = await store.stored(
             [corpus["water"]], CRITERIA.version, JUDGE_PROMPT_VERSION
         )
         assert found[corpus["water"]].reason == "второе"
+
+        await _clear(session_factory, corpus["water"])
+
+    @pytest.mark.asyncio
+    async def test_rules_verdicts_carry_no_model(self, session_factory, corpus) -> None:
+        """`model IS NULL` — признак решения, которое ничего не стоило."""
+        store = SqlVerdictStore(session_factory)
+        await store.save(
+            [
+                TenderVerdict(
+                    tender_id=corpus["water"],
+                    confidence=Confidence.CONFIRMED,
+                    reason="по правилам",
+                    decided_by="rules",
+                )
+            ],
+            CRITERIA.version,
+            JUDGE_PROMPT_VERSION,
+            "test-model",
+        )
+
+        async with session_factory() as session:
+            model = await session.scalar(
+                select(ResearchVerdict.model).where(
+                    ResearchVerdict.tender_id == corpus["water"]
+                )
+            )
+        assert model is None
+
+        await _clear(session_factory, corpus["water"])
+
+    @pytest.mark.asyncio
+    async def test_a_batch_with_one_tender_twice_does_not_explode(
+        self, session_factory, corpus
+    ) -> None:
+        """Postgres не применяет ON CONFLICT дважды к одной строке за INSERT."""
+        store = SqlVerdictStore(session_factory)
+        await store.save(
+            [
+                TenderVerdict(
+                    tender_id=corpus["water"], confidence=Confidence.REJECTED, reason="раз"
+                ),
+                TenderVerdict(
+                    tender_id=corpus["water"], confidence=Confidence.CONFIRMED, reason="два"
+                ),
+            ],
+            CRITERIA.version,
+            JUDGE_PROMPT_VERSION,
+            "test-model",
+        )
+
+        found = await store.stored(
+            [corpus["water"]], CRITERIA.version, JUDGE_PROMPT_VERSION
+        )
+        assert found[corpus["water"]].reason == "два"
 
         await _clear(session_factory, corpus["water"])
 

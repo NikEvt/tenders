@@ -22,7 +22,12 @@ from decimal import Decimal
 
 from sqlalchemy import ColumnElement, and_, exists, func, or_, select
 
-from libs.shared.db.schema import DocumentText, LlmVerdict, Tender
+from libs.shared.db.schema import (
+    DocumentText,
+    ResearchVerdict,
+    SavedFilter,
+    Tender,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +52,10 @@ class TenderCriteria:
     has_text: bool | None = None
     tender_ids: tuple[int, ...] = ()
     filter_id: int | None = None
-    matched_only: bool = True
+    #: Какие вердикты считать прошедшими фильтр. Пустой кортеж — все.
+    #: Не булев флаг: «покажи, что фильтр отклонил» — вопрос, который задают, а
+    #: `matched_only=False` смешал бы отклонённые с прошедшими в одну кучу.
+    filter_verdicts: tuple[str, ...] = ("confirmed",)
     extra: dict[str, ColumnElement[bool]] = field(default_factory=dict)
 
 
@@ -97,7 +105,7 @@ def predicates(criteria: TenderCriteria) -> dict[str, ColumnElement[bool]]:
     if criteria.tender_ids:
         result["tender_ids"] = Tender.id.in_(criteria.tender_ids)
     if criteria.filter_id is not None:
-        result["filter_id"] = _passed_filter(criteria.filter_id, criteria.matched_only)
+        result["filter_id"] = _passed_filter(criteria.filter_id, criteria.filter_verdicts)
 
     result.update(criteria.extra)
     return result
@@ -128,8 +136,28 @@ def _has_text(expected: bool) -> ColumnElement[bool]:
     return present if expected else ~present
 
 
-def _passed_filter(filter_id: int, matched_only: bool) -> ColumnElement[bool]:
-    verdicts = select(LlmVerdict.tender_id).where(LlmVerdict.filter_id == filter_id)
-    if matched_only:
-        verdicts = verdicts.where(LlmVerdict.match.is_(True))
+def _passed_filter(
+    filter_id: int, confidences: tuple[str, ...]
+) -> ColumnElement[bool]:
+    """Закупки, разобранные по сохранённому критерию.
+
+    Связь идёт через **версию критерия**, а не через идентификатор фильтра:
+    вердикт принадлежит паре «закупка + критерий», а не запуску и не карточке
+    фильтра. Благодаря этому правка шаблонов обесценивает прежние решения сама
+    собой — новая версия просто не находит старых вердиктов.
+
+    Вердикты перечисляются, а не сводятся к «только прошедшие»: аналитику нужно
+    уметь спросить и то, что фильтр отклонил, — иначе проверить его работу
+    можно только по тому, что он пропустил.
+    """
+    version = (
+        select(SavedFilter.spec["version"].astext)
+        .where(SavedFilter.id == filter_id)
+        .scalar_subquery()
+    )
+    verdicts = select(ResearchVerdict.tender_id).where(
+        ResearchVerdict.criteria_version == version
+    )
+    if confidences:
+        verdicts = verdicts.where(ResearchVerdict.confidence.in_(confidences))
     return Tender.id.in_(verdicts.scalar_subquery())

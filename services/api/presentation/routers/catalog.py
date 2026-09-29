@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
 
@@ -29,6 +30,15 @@ from services.api.presentation.schemas import (
 
 router = APIRouter(tags=["Каталог"])
 
+Verdict = Literal["confirmed", "rejected", "disputed"]
+
+#: Вердикты сохранённого фильтра. Не указано — только прошедшие: так выдача по
+#: фильтру означает «фильтр это отобрал», а не «фильтр это видел».
+FilterVerdictQuery = Annotated[
+    list[Verdict] | None,
+    Query(description="Какие вердикты фильтра показывать; по умолчанию — прошедшие"),
+]
+
 
 def build_filter(
     q: str | None,
@@ -44,6 +54,7 @@ def build_filter(
     documents_status: DocumentsStatus | None,
     has_text: bool | None,
     filter_id: int | None,
+    filter_verdict: list[str] | None = None,
 ) -> TenderFilter:
     return TenderFilter(
         query=q,
@@ -59,6 +70,7 @@ def build_filter(
         documents_status=documents_status,
         has_text=has_text,
         filter_id=filter_id,
+        filter_verdicts=tuple(filter_verdict) if filter_verdict else ("confirmed",),
     )
 
 
@@ -80,11 +92,13 @@ async def list_tenders(
     has_text: bool | None = Query(
         default=None, description="Есть ли у закупки распознанный текст документов"
     ),
-    filter_id: int | None = Query(default=None, description="Только прошедшие LLM-фильтр"),
+    filter_id: int | None = Query(default=None, description="Отбор по сохранённому фильтру"),
+    filter_verdict: FilterVerdictQuery = None,
 ) -> PageOut:
     filters = build_filter(
         q, price_min, price_max, okpd2, region, customer_inn, since, until,
         only_active, deadline_changed, documents_status, has_text, filter_id,
+        filter_verdict,
     )
     return PageOut.of(await catalog.list(filters, page))
 
@@ -101,15 +115,21 @@ async def search_tenders(
     since: date | None = None,
     until: date | None = None,
     only_active: bool = True,
+    filter_id: int | None = Query(default=None, description="Отбор по сохранённому фильтру"),
+    filter_verdict: FilterVerdictQuery = None,
 ) -> PageOut:
     """Гибридный поиск: находит и по точным словам, и по смыслу.
 
     Ищет в том числе по тексту приложенной документации — часть требований
     звучит только в ТЗ.
+
+    Сохранённый фильтр применяется и здесь. Раньше не применялся, и условие,
+    выставленное в интерфейсе, переставало действовать от двух набранных
+    символов — показанное, но не применённое условие врёт молча.
     """
     filters = build_filter(
         None, price_min, price_max, okpd2, region, None, since, until,
-        only_active, False, None, None, None,
+        only_active, False, None, None, filter_id, filter_verdict,
     )
     return PageOut.of(await search.search(q, filters, page))
 
@@ -132,6 +152,7 @@ async def tender_facets(
         default=None, description="Есть ли у закупки распознанный текст документов"
     ),
     filter_id: int | None = None,
+    filter_verdict: FilterVerdictQuery = None,
     explain_empty: bool = Query(
         default=False, description="Посчитать, какое условие отсекает больше всего"
     ),
@@ -147,6 +168,7 @@ async def tender_facets(
     filters = build_filter(
         q, price_min, price_max, okpd2, region, customer_inn, since, until,
         only_active, deadline_changed, documents_status, has_text, filter_id,
+        filter_verdict,
     )
     facets, hint = await use_case.execute(filters, explain_empty)
     return FacetsOut.of(facets, hint)
@@ -171,6 +193,7 @@ async def tender_groups(
         default=None, description="Есть ли у закупки распознанный текст документов"
     ),
     filter_id: int | None = None,
+    filter_verdict: FilterVerdictQuery = None,
 ) -> GroupsOut:
     """Оглавление сгруппированного списка: счётчик и сумма НМЦК на группу.
 
@@ -183,6 +206,7 @@ async def tender_groups(
     filters = build_filter(
         q, price_min, price_max, okpd2, region, customer_inn, since, until,
         only_active, deadline_changed, documents_status, has_text, filter_id,
+        filter_verdict,
     )
     return GroupsOut.of(group, await use_case.execute(filters, group))
 

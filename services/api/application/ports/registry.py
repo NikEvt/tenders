@@ -17,6 +17,8 @@ from services.api.application.ports.catalog import (
     TenderSearchPort,
     TenderSimilarityPort,
 )
+from services.api.application.ports.corpus import CorpusStatsPort
+from services.api.application.ports.crawl import CrawlPublisherPort
 from services.api.application.ports.digest import DigestReadPort
 from services.api.application.ports.documents import DocumentReadPort, FragmentSearchPort
 from services.api.application.ports.downstream import LlmServicePort, RecsysServicePort
@@ -32,6 +34,7 @@ from services.api.application.ports.monitoring import (
     ServiceProbePort,
 )
 from services.api.application.ports.profile import ProfileHistoryPort
+from services.api.application.ports.research import ResearchReadPort
 from services.api.application.ports.settings import RuntimeSettingsPort
 
 
@@ -50,10 +53,13 @@ class Ports(Protocol):
     queues: QueueAdminPort
     crawler_runs: CrawlerRunReadPort
     pipeline: DocumentPipelinePort
+    corpus: CorpusStatsPort
     events: EventTrailPort
     app_state: AppStatePort
     profile_history: ProfileHistoryPort
+    research: ResearchReadPort
     runtime_settings: RuntimeSettingsPort
     storage: ObjectStoragePort
+    crawl: CrawlPublisherPort
     llm: LlmServicePort
     recsys: RecsysServicePort

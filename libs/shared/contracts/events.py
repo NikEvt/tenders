@@ -58,6 +58,9 @@ class CrawlRequested(Event):
     document_types: list[str] = Field(default_factory=list)
     #: Кто заказал. Нужен, чтобы связать выгрузку с исследованием.
     research_id: int | None = None
+    #: Задание для `GET /jobs/{id}`. Пусто — заявка идёт без отчёта о ходе:
+    #: так её шлёт расписание, которому докладывать некому.
+    job_id: uuid.UUID | None = None
 
 
 class DocumentStored(Event):

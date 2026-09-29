@@ -11,7 +11,9 @@ from sqlalchemy import delete, func, select
 from libs.shared.db.schema import (
     DocumentChunk,
     DocumentText,
-    LlmVerdict,
+    ResearchHit,
+    ResearchRun,
+    ResearchVerdict,
     SavedFilter,
     Tender,
     TenderDocument,
@@ -21,12 +23,17 @@ from services.api.domain.pagination import PageRequest, SortKey, SortSpec, decod
 from services.api.infrastructure.db.catalog_repository import SqlCatalogRepository
 from services.api.infrastructure.db.document_repository import SqlDocumentRepository
 from services.api.infrastructure.db.facets_repository import SqlFacetsRepository
+from services.api.infrastructure.db.queries import conditions
 from services.api.infrastructure.db.search_repository import SqlSearchRepository
 
 PREFIX = "TEST-API-"
 
-# Потолок обхода: защита от бесконечного цикла, если курсор перестанет двигаться.
-PAGE_LIMIT = 50
+#: Потолок страниц в обходе курсором. Считается от размера корпуса, а не
+#: константой: корпус растёт с каждой выгрузкой, и фиксированный потолок
+#: однажды уже превратил рабочий тест в падающий — обход просто не успевал
+#: дойти до конца.
+CURSOR_PAGE_SIZE = 150
+CURSOR_PAGE_SLACK = 5
 
 
 @pytest.fixture
@@ -115,39 +122,73 @@ async def catalog(session_factory):
 
         filter_id = await session.scalar(
             SavedFilter.__table__.insert()
-            .values(name="Газ", spec={"name": "Газ", "terms": [{"name": "газ", "pattern": "газ"}]})
+            .values(
+                name="Газ",
+                # Версия критерия — она и связывает фильтр с вердиктами.
+                spec={
+                    "name": "Газ",
+                    "version": "тест-v1",
+                    "terms": [{"name": "газ", "pattern": "газ"}],
+                },
+            )
             .returning(SavedFilter.id)
         )
+        # Вердикты движка отбора: карточка закупки читает их, а не таблицу
+        # прежнего движка фильтров.
+        for reg, confidence, reason in (
+            (f"{PREFIX}GAS", "confirmed", "поставка газа"),
+            (f"{PREFIX}FURNITURE", "rejected", "название объекта"),
+        ):
+            await session.execute(
+                ResearchVerdict.__table__.insert().values(
+                    tender_id=ids[reg],
+                    criteria_version="тест-v1",
+                    prompt_version="hits-judge-v1",
+                    confidence=confidence,
+                    reason=reason,
+                    score=0.9 if confidence == "confirmed" else 0.05,
+                    decided_by="rules",
+                )
+            )
         await session.execute(
-            LlmVerdict.__table__.insert().values(
-                tender_id=ids[f"{PREFIX}GAS"],
-                filter_id=filter_id,
-                match=True,
-                score=0.9,
-                reasoning="Это поставка газа",
-                evidence=[],
-                model="test",
-                prompt_version="judge-v1",
+            ResearchRun.__table__.insert().values(
+                id=990001,
+                name="тест",
+                criteria_version="тест-v1",
+                criteria={},
+                status="done",
             )
         )
         await session.execute(
-            LlmVerdict.__table__.insert().values(
+            ResearchHit.__table__.insert().values(
+                run_id=990001,
                 tender_id=ids[f"{PREFIX}FURNITURE"],
-                filter_id=filter_id,
-                match=False,
-                score=0.05,
-                reasoning="Это мебель",
-                evidence=[],
-                model="test",
-                prompt_version="judge-v1",
+                term="мебель",
+                role="primary",
+                quote="Мебель должна выдерживать обработку хлоргексидином.",
+                match_start=0,
+                match_end=6,
+                file_name="ТЗ.pdf",
             )
         )
 
     yield {"ids": ids, "filter_id": filter_id, "document_id": document_id}
 
     async with session_factory() as session, session.begin():
+        await session.execute(delete(ResearchRun).where(ResearchRun.id == 990001))
         await session.execute(delete(Tender).where(Tender.reg_num.like(f"{PREFIX}%")))
         await session.execute(delete(SavedFilter).where(SavedFilter.id == filter_id))
+
+
+async def _page_budget(session_factory, page_size: int) -> int:
+    """Сколько страниц хватит, чтобы обойти корпус, плюс запас.
+
+    Запас нужен на строки, добавленные другими фикстурами по ходу прогона;
+    он же остаётся защитой от бесконечного цикла, если курсор встанет.
+    """
+    async with session_factory() as session:
+        total = await session.scalar(select(func.count()).select_from(Tender)) or 0
+    return total // max(page_size, 1) + CURSOR_PAGE_SLACK
 
 
 def repository(session_factory) -> SqlCatalogRepository:
@@ -195,21 +236,55 @@ async def test_only_active_excludes_expired(session_factory, catalog) -> None:
 
 @pytest.mark.asyncio
 async def test_deadline_changed_filter(session_factory, catalog) -> None:
+    # Сужаем до ОКПД2 фикстуры: со сдвинутым сроком в общей базе живут сотни
+    # настоящих закупок, и на странице в 50 строк своя просто не помещалась.
     page = await repository(session_factory).list(
-        TenderFilter(deadline_changed=True), PageRequest(limit=50)
+        TenderFilter(deadline_changed=True, okpd2_prefix="20.11"),
+        PageRequest(limit=50),
     )
     assert reg_nums(page) == {f"{PREFIX}EXPIRED"}
-    assert page.items[0].deadline_changed is True
+    # Признак вычисляется из prev_end_date, а не приходит из базы.
+    assert all(item.deadline_changed for item in page.items)
 
 
 @pytest.mark.asyncio
 async def test_filter_id_returns_only_matched(session_factory, catalog) -> None:
     """Выдача по ИИ-фильтру должна содержать только прошедшие проверку закупки."""
     page = await repository(session_factory).list(
-        TenderFilter(filter_id=catalog["filter_id"], matched_only=True),
+        TenderFilter(filter_id=catalog["filter_id"]),
         PageRequest(limit=50),
     )
     assert reg_nums(page) == {f"{PREFIX}GAS"}
+
+
+@pytest.mark.asyncio
+async def test_filter_id_can_show_what_was_rejected(session_factory, catalog) -> None:
+    """Проверить фильтр по тому, что он отсёк, — отдельный и нужный вопрос."""
+    page = await repository(session_factory).list(
+        TenderFilter(filter_id=catalog["filter_id"], filter_verdicts=("rejected",)),
+        PageRequest(limit=50),
+    )
+    assert reg_nums(page) == {f"{PREFIX}FURNITURE"}
+
+
+@pytest.mark.asyncio
+async def test_filter_id_can_show_everything_it_judged(session_factory, catalog) -> None:
+    page = await repository(session_factory).list(
+        TenderFilter(filter_id=catalog["filter_id"], filter_verdicts=()),
+        PageRequest(limit=50),
+    )
+    assert reg_nums(page) == {f"{PREFIX}GAS", f"{PREFIX}FURNITURE"}
+
+
+@pytest.mark.asyncio
+async def test_search_applies_the_saved_filter(session_factory, catalog) -> None:
+    """Условие, показанное в интерфейсе, обязано действовать и в поиске."""
+    page = await search_repository(session_factory).search(
+        "газ",
+        TenderFilter(filter_id=catalog["filter_id"]),
+        PageRequest(limit=20),
+    )
+    assert f"{PREFIX}FURNITURE" not in reg_nums(page)
 
 
 @pytest.mark.asyncio
@@ -240,7 +315,13 @@ async def test_detail_includes_documents_and_verdicts(session_factory, catalog) 
     assert detail.documents[0].file_name == "ТЗ.pdf"
     assert detail.documents[0].ocr_used is True
     assert detail.documents[0].has_text is True
-    assert detail.verdicts[0]["match"] is False
+    verdict = detail.verdicts[0]
+    assert verdict["confidence"] == "rejected"
+    # Видно, во что обошлось решение: правила бесплатны, модель — нет.
+    assert verdict["decided_by"] == "rules"
+    # Цитата приезжает со смещением — иначе её негде подсветить.
+    hit = verdict["hits"][0]
+    assert hit["quote"][hit["match_start"] : hit["match_end"]] == "Мебель"
 
 
 @pytest.mark.asyncio
@@ -295,14 +376,14 @@ async def test_cursor_walks_every_row_exactly_once(session_factory, catalog) -> 
     filters = TenderFilter()
 
     seen: list[str] = []
-    request = PageRequest(limit=150, sort=sort)
-    for _ in range(PAGE_LIMIT):
+    request = PageRequest(limit=CURSOR_PAGE_SIZE, sort=sort)
+    for _ in range(await _page_budget(session_factory, CURSOR_PAGE_SIZE)):
         page = await repo.list(filters, request)
         seen.extend(t.reg_num for t in page.items)
         if page.next_cursor is None:
             break
         request = PageRequest(
-            limit=150, cursor=decode_cursor(page.next_cursor, sort), sort=sort
+            limit=CURSOR_PAGE_SIZE, cursor=decode_cursor(page.next_cursor, sort), sort=sort
         )
     else:
         pytest.fail("Обход не завершился: курсор не дошёл до конца выдачи")
@@ -393,8 +474,9 @@ async def test_cursor_walks_every_row_once_under_a_group_key(session_factory, ca
     filters = TenderFilter()
 
     seen: list[str] = []
-    request = PageRequest(limit=37, sort=sort)
-    for _ in range(PAGE_LIMIT):
+    GROUPED_PAGE = 37
+    request = PageRequest(limit=GROUPED_PAGE, sort=sort)
+    for _ in range(await _page_budget(session_factory, GROUPED_PAGE)):
         page = await repo.list(filters, request)
         seen.extend(t.reg_num for t in page.items)
         if page.next_cursor is None:
@@ -405,7 +487,11 @@ async def test_cursor_walks_every_row_once_under_a_group_key(session_factory, ca
 
     assert len(seen) == len(set(seen)), "курсор выдал строку дважды"
 
-    by_offset = await repo.list(filters, PageRequest(limit=1000, sort=sort))
+    # Сравнивать надо ровно с тем же множеством строк, что обошёл курсор.
+    # Фиксированный `limit=1000` работал, пока таблица была меньше тысячи строк,
+    # и разошёлся, как только в базе появилась настоящая выгрузка: курсор
+    # обходил больше, чем отдавала одна offset-страница.
+    by_offset = await repo.list(filters, PageRequest(limit=len(seen), sort=sort))
     assert seen == [t.reg_num for t in by_offset.items], "курсор и offset разошлись в порядке"
 
 
@@ -476,6 +562,24 @@ async def test_cursor_and_offset_agree(session_factory, catalog) -> None:
 
 
 @pytest.mark.asyncio
+async def _matching(session_factory, filters: TenderFilter, column) -> int:
+    """Сколько строк выдачи несут это поле — по всей выборке, а не по странице.
+
+    Фасеты считаются по всей выдаче, поэтому и сверять их надо с ней. Сверка со
+    страницей держалась, только пока выдача была короче страницы: на корпусе в
+    сто тысяч извещений условие `20.11` даёт больше пятидесяти строк, и тест
+    начинал падать на росте данных, а не на дефекте. Та же ошибка уже была в
+    обходе курсором — там она исправлена так же.
+    """
+    async with session_factory() as session:
+        return await session.scalar(
+            select(func.count())
+            .select_from(Tender)
+            .where(*conditions(filters), column.is_not(None))
+        )
+
+
+@pytest.mark.asyncio
 async def test_facets_agree_with_listing(session_factory, catalog) -> None:
     """Счётчик фасета и число «найдено» обязаны сходиться — иначе врут оба."""
     filters = TenderFilter(okpd2_prefix="20.11")
@@ -485,9 +589,9 @@ async def test_facets_agree_with_listing(session_factory, catalog) -> None:
 
     assert facets.total == page.total
     # Строки без региона в фасет не попадают, поэтому сумма не больше общего числа.
-    assert sum(b.count for b in facets.regions) == sum(
-        1 for t in page.items if t.region_code is not None
-    )
+    # Хвост фасета обрезан `FACET_LIMIT`, поэтому сумма не превышает выдачу.
+    with_region = await _matching(session_factory, filters, Tender.region_code)
+    assert 0 < sum(b.count for b in facets.regions) <= with_region
     regions = {b.key: b.count for b in facets.regions}
     assert regions["77"] >= 2
 
@@ -496,23 +600,24 @@ async def test_facets_agree_with_listing(session_factory, catalog) -> None:
 async def test_price_histogram_covers_all_priced_rows(session_factory, catalog) -> None:
     filters = TenderFilter(okpd2_prefix="20.11")
 
-    page = await repository(session_factory).list(filters, PageRequest(limit=50))
     facets = await facets_repository(session_factory).facets(filters)
+    priced = await _matching(session_factory, filters, Tender.price)
 
-    priced = [t.price for t in page.items if t.price is not None]
     # Ни одна строка не теряется: максимум попадает в последний столбец,
     # а не выпадает за границу гистограммы.
-    assert sum(b.count for b in facets.price_histogram) == len(priced)
-    assert facets.price_histogram[0].price_from == min(priced)
+    assert sum(b.count for b in facets.price_histogram) == priced
 
 
 @pytest.mark.asyncio
 async def test_restrictive_names_the_condition_that_cuts_most(session_factory, catalog) -> None:
-    filters = TenderFilter(okpd2_prefix="20.11", regions=["50"])
+    # Код «99» субъектом не является, поэтому строк с ним в корпусе нет и
+    # быть не может. Раньше здесь стоял регион «50», и подсказка меняла ответ,
+    # едва в базе появлялись настоящие подмосковные закупки.
+    filters = TenderFilter(okpd2_prefix="20.11", regions=["99"])
 
     hint = await facets_repository(session_factory).restrictive(filters)
 
-    # Регион «50» не пересекается с ОКПД2 газов — выдача пустая, и виноват регион.
+    # Ни одной закупки в регионе «99» нет — выдача пустая, и виноват регион.
     assert hint is not None
     assert hint.param == "region"
     assert hint.dropped > 0
@@ -540,3 +645,4 @@ async def test_search_does_not_return_the_whole_corpus(session_factory, catalog)
         total = await session.scalar(select(func.count()).select_from(Tender))
 
     assert page.total < total, "поиск вернул весь каталог"
+

@@ -34,6 +34,10 @@ export interface paths {
          *
          *     Ищет в том числе по тексту приложенной документации — часть требований
          *     звучит только в ТЗ.
+         *
+         *     Сохранённый фильтр применяется и здесь. Раньше не применялся, и условие,
+         *     выставленное в интерфейсе, переставало действовать от двух набранных
+         *     символов — показанное, но не применённое условие врёт молча.
          */
         get: operations["search_tenders_tenders_search_get"];
         put?: never;
@@ -152,6 +156,31 @@ export interface paths {
         get: operations["tender_events_tenders__reg_num__events_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/crawl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request Crawl
+         * @description Заказывает выгрузку периода.
+         *
+         *     ЕИС отдаёт извещения суточными архивами, поэтому «обновить» означает
+         *     перекачать архивы последних дней: новыми окажутся лишь те извещения,
+         *     которых ещё не было. Уже закрытые дни пропускаются сами — день считается
+         *     закрытым, только если выгрузка шла после его окончания.
+         */
+        post: operations["request_crawl_crawl_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -304,7 +333,9 @@ export interface paths {
         put?: never;
         /**
          * Run Filter
-         * @description Запуск LLM-фильтрации. Прогон занимает минуты — отвечаем job_id.
+         * @description Запуск исследования по выбранному охвату. Прогон идёт минутами — отвечаем job_id.
+         *
+         *     Ход прогона виден в `GET /jobs/{job_id}`, результат — в `GET /research/runs/{run_id}`.
          */
         post: operations["run_filter_filters__filter_id__run_post"];
         delete?: never;
@@ -342,7 +373,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Job Status */
+        /**
+         * Job Status
+         * @description Ход длительной операции: фаза, счётчик внутри неё и время старта.
+         *
+         *     Схема объявлена, а не выведена из `dict`: по этому ответу рисуется шкала
+         *     ожидания, и клиент обязан получать её тип из `openapi.json`, а не
+         *     переписывать руками.
+         */
         get: operations["job_status_jobs__job_id__get"];
         put?: never;
         post?: never;
@@ -594,6 +632,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/research/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Runs */
+        get: operations["runs_research_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/research/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Run */
+        get: operations["run_research_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/research/runs/{run_id}/tenders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Tenders
+         * @description Закупки прогона с вердиктом и цитатами.
+         *
+         *     `confidence` — не фильтр «показать только хорошее»: спорные и отклонённые
+         *     нужны не меньше, потому что по ним видно, что именно движок отбросил.
+         */
+        get: operations["tenders_research_runs__run_id__tenders_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/research/runs/{run_id}/market": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Market
+         * @description Разрезы по подтверждённым закупкам прогона.
+         */
+        get: operations["market_research_runs__run_id__market_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/monitoring/health": {
         parameters: {
             query?: never;
@@ -692,6 +807,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Overview
+         * @description Состав корпуса за период: по дням, регионам и ОКПД2.
+         *
+         *     Период один на все разрезы — иначе «топ регионов за всё время» рядом со
+         *     столбиками за квартал читался бы как один разрез, описывая другое
+         *     множество.
+         */
+        get: operations["overview_data_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/processing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Processing
+         * @description Ход векторизации и сегодняшней выгрузки.
+         */
+        get: operations["processing_data_processing_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -736,6 +895,27 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/system/load-level": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Load Level */
+        get: operations["load_level_system_load_level_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Set Load Level
+         * @description Смена уровня. Ответ приходит сразу, воркеры подтягиваются за секунды.
+         */
+        patch: operations["set_load_level_system_load_level_patch"];
         trace?: never;
     };
     "/health": {
@@ -803,6 +983,59 @@ export interface components {
             /** Query */
             query: string;
         };
+        /**
+         * CorpusOverviewOut
+         * @description Состав корпуса за период. Период один на все разрезы — см. use case.
+         */
+        CorpusOverviewOut: {
+            /**
+             * Since
+             * Format: date
+             */
+            since: string;
+            /**
+             * Until
+             * Format: date
+             */
+            until: string;
+            /** Total */
+            total: number;
+            /** Total All Time */
+            total_all_time: number;
+            /** Earliest */
+            earliest: string | null;
+            /** Latest */
+            latest: string | null;
+            /** By Day */
+            by_day: components["schemas"]["DayBucketOut"][];
+            by_region: components["schemas"]["DistributionOut"];
+            by_okpd2: components["schemas"]["DistributionOut"];
+        };
+        /** CorpusProcessingOut */
+        CorpusProcessingOut: {
+            embeddings: components["schemas"]["EmbeddingProgressOut"];
+            today: components["schemas"]["TodayIngestOut"];
+            /** Documents Downloaded */
+            documents_downloaded: number;
+            /** Documents Extracted */
+            documents_extracted: number;
+        };
+        /**
+         * CrawlIn
+         * @description Заявка на выгрузку.
+         *
+         *     Умолчание — вчера и сегодня: ЕИС публикует с задержкой, и вчерашний архив
+         *     к утру ещё дописывается. Пустые регионы означают «все настроенные у
+         *     краулера»: какие именно он качает, шлюз не знает.
+         */
+        CrawlIn: {
+            /** Since */
+            since?: string | null;
+            /** Until */
+            until?: string | null;
+            /** Regions */
+            regions?: string[];
+        };
         /** CrawlerRunOut */
         CrawlerRunOut: {
             /** Run Id */
@@ -836,6 +1069,25 @@ export interface components {
             /** Items */
             items: components["schemas"]["CrawlerRunOut"][];
         };
+        /**
+         * DayBucketOut
+         * @description День на гистограмме публикаций.
+         *
+         *     `crawled` отличает «в этот день ничего не публиковали» от «этот день мы не
+         *     выгружали». Без этого различия дыра в покрытии читалась бы как факт о
+         *     рынке.
+         */
+        DayBucketOut: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Count */
+            count: number;
+            /** Crawled */
+            crawled: boolean;
+        };
         /** DeadLetterOut */
         DeadLetterOut: {
             /** Message Id */
@@ -853,6 +1105,24 @@ export interface components {
         DigestDatesOut: {
             /** Dates */
             dates: string[];
+        };
+        /**
+         * DistributionOut
+         * @description Верхушка разреза плюс хвост.
+         *
+         *     `others` и `unknown` обязательны: сумма показанного, хвоста и «без
+         *     признака» равна `total`. Без них двенадцать столбиков читаются как весь
+         *     корпус.
+         */
+        DistributionOut: {
+            /** Top */
+            top: components["schemas"]["SliceOut"][];
+            /** Others */
+            others: number;
+            /** Unknown */
+            unknown: number;
+            /** Total */
+            total: number;
         };
         /** DocumentChunksOut */
         DocumentChunksOut: {
@@ -888,6 +1158,8 @@ export interface components {
             funnel: components["schemas"]["PipelineStageOut"][];
             /** Failures */
             failures: components["schemas"]["PipelineStageOut"][];
+            /** Skip Reasons */
+            skip_reasons: components["schemas"]["PipelineStageOut"][];
         };
         /** DownloadOut */
         DownloadOut: {
@@ -897,6 +1169,19 @@ export interface components {
             file_name: string | null;
             /** Expires In */
             expires_in: number;
+        };
+        /** EmbeddingProgressOut */
+        EmbeddingProgressOut: {
+            /** Chunks Total */
+            chunks_total: number;
+            /** Chunks Embedded */
+            chunks_embedded: number;
+            /** Tenders Total */
+            tenders_total: number;
+            /** Tenders Embedded */
+            tenders_embedded: number;
+            /** Queue Depth */
+            queue_depth: number | null;
         };
         /** FacetBucketOut */
         FacetBucketOut: {
@@ -1041,6 +1326,139 @@ export interface components {
             /** Services */
             services: components["schemas"]["ServiceHealthOut"][];
         };
+        /**
+         * JobAcceptedOut
+         * @description Ответ на команду, которая исполняется не сразу.
+         */
+        JobAcceptedOut: {
+            /** Job Id */
+            job_id: string;
+        };
+        /**
+         * JobOut
+         * @description Состояние длительной операции.
+         *
+         *     `total` намеренно допускает `null`: объём фазы известен не сразу — сборка
+         *     сводки узнаёт его после кластеризации, обход корпуса после подсчёта. Ноль
+         *     вместо `null` заставил бы клиента показать «0 %» там, где считать ещё
+         *     нечего, то есть выдумать число.
+         */
+        JobOut: {
+            /** Job Id */
+            job_id: string;
+            /** Kind */
+            kind: string;
+            /** Status */
+            status: string;
+            /** Phase */
+            phase?: string | null;
+            /** Total */
+            total?: number | null;
+            /**
+             * Processed
+             * @default 0
+             */
+            processed: number;
+            /** Result */
+            result?: {
+                [key: string]: unknown;
+            } | null;
+            /** Error */
+            error?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * LoadLevelIn
+         * @description Заявка на смену уровня нагрузки.
+         *
+         *     Уровень проверяется здесь, а не в сценарии: пользователь, попросивший
+         *     седьмой уровень, должен получить отказ, а не молчаливое приведение к
+         *     среднему. Приведение уместно при чтении настройки, где альтернатива —
+         *     не подняться вовсе.
+         */
+        LoadLevelIn: {
+            /**
+             * Level
+             * @enum {integer}
+             */
+            level: 1 | 2 | 3;
+        };
+        /**
+         * LoadLevelOut
+         * @description Действующий уровень и потолки, которые из него следуют.
+         *
+         *     Потолки посчитаны по числу ядер. Поправку на память накладывает тот, кто
+         *     разбирает: у docs-worker свой лимит, и при тесном он опустит пул ниже.
+         *     Это справка о заявленном уровне, а не отчёт о применённом.
+         */
+        LoadLevelOut: {
+            /** Level */
+            level: number;
+            /** Extraction Workers */
+            extraction_workers: number;
+            /** Docs Prefetch */
+            docs_prefetch: number;
+            /** Embedding Prefetch */
+            embedding_prefetch: number;
+            /** Crawl Workers */
+            crawl_workers: number;
+            /** Llm Concurrency */
+            llm_concurrency: number;
+            /** Eis Rps */
+            eis_rps: number;
+            /** Omp Threads */
+            omp_threads: number;
+        };
+        /** MarketBucketOut */
+        MarketBucketOut: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Count */
+            count: number;
+            /** Total */
+            total: string;
+            /** Average */
+            average: string | null;
+        };
+        /**
+         * MarketOut
+         * @description Разрезы рынка.
+         *
+         *     `median_price` отдаётся рядом со `average_price`, а не вместо: у НМЦК
+         *     тяжёлый правый хвост, и одно среднее описывает рынок, которого нет.
+         *     `top_share` показывает этот хвост числом.
+         */
+        MarketOut: {
+            /** Total Count */
+            total_count: number;
+            /** Priced Count */
+            priced_count: number;
+            /** Total Value */
+            total_value: string;
+            /** Median Price */
+            median_price: string | null;
+            /** Average Price */
+            average_price: string | null;
+            /** Top Share */
+            top_share: number;
+            /** By Region */
+            by_region: components["schemas"]["MarketBucketOut"][];
+            /** By Customer */
+            by_customer: components["schemas"]["MarketBucketOut"][];
+            /** By Okpd2 */
+            by_okpd2: components["schemas"]["MarketBucketOut"][];
+        };
         /** MatchCountOut */
         MatchCountOut: {
             /**
@@ -1150,6 +1568,133 @@ export interface components {
             created_at: string;
         };
         /**
+         * ResearchFunnelOut
+         * @description Воронка прогона — ветвление, а не каскад.
+         *
+         *     `documents_pending` и `not_reached` отдаются всегда, даже нулями: это
+         *     знаменатели. «Находок нет» читается только рядом с «прочитано столько-то»,
+         *     а «спорных 8, решено 5» — рядом с «до трёх не дошли».
+         */
+        ResearchFunnelOut: {
+            /** Tenders Total */
+            tenders_total: number;
+            /** Tenders Candidate */
+            tenders_candidate: number;
+            /** Documents Scanned */
+            documents_scanned: number;
+            /** Documents Pending */
+            documents_pending: number;
+            /** Hits Found */
+            hits_found: number;
+            /** Reviewed */
+            reviewed: number;
+            /** Rejected By Rules */
+            rejected_by_rules: number;
+            /** Confirmed By Rules */
+            confirmed_by_rules: number;
+            /** Disputed */
+            disputed: number;
+            /** From Cache */
+            from_cache: number;
+            /** Asked Model */
+            asked_model: number;
+            /** Not Reached */
+            not_reached: number;
+            /** Failed */
+            failed: number;
+        };
+        /**
+         * ResearchHitOut
+         * @description Цитата вместе с границами совпадения внутри неё.
+         *
+         *     Границы — не украшение: без них обрезка длинной цитаты показывает один
+         *     левый контекст, и совпадение оказывается за кадром.
+         */
+        ResearchHitOut: {
+            /** Term */
+            term: string;
+            /** Role */
+            role: string;
+            /** Quote */
+            quote: string;
+            /** Match Start */
+            match_start: number;
+            /** Match End */
+            match_end: number;
+            /** File Name */
+            file_name: string | null;
+            /** Page */
+            page: number | null;
+        };
+        /** ResearchRunOut */
+        ResearchRunOut: {
+            /** Run Id */
+            run_id: number;
+            /** Name */
+            name: string;
+            /** Criteria Version */
+            criteria_version: string;
+            /** Status */
+            status: string;
+            /** Regions */
+            regions: string[];
+            /** Date From */
+            date_from: string | null;
+            /** Date To */
+            date_to: string | null;
+            /** Started At */
+            started_at: string | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Error Message */
+            error_message: string | null;
+            /** Confirmed */
+            confirmed: number;
+            /** Rejected */
+            rejected: number;
+            funnel: components["schemas"]["ResearchFunnelOut"];
+        };
+        /** ResearchTenderOut */
+        ResearchTenderOut: {
+            /** Tender Id */
+            tender_id: number;
+            /** Reg Num */
+            reg_num: string;
+            /** Name */
+            name: string | null;
+            /** Price */
+            price: string | null;
+            /** Region Code */
+            region_code: string | null;
+            /** Customer Name */
+            customer_name: string | null;
+            /** Customer Inn */
+            customer_inn: string | null;
+            /** Okpd2 Code */
+            okpd2_code: string | null;
+            /** Confidence */
+            confidence: string;
+            /** Reason */
+            reason: string | null;
+            /** Decided By */
+            decided_by: string;
+            /** Score */
+            score: number;
+            /** Hits */
+            hits: components["schemas"]["ResearchHitOut"][];
+        };
+        /** ResearchTendersOut */
+        ResearchTendersOut: {
+            /** Items */
+            items: components["schemas"]["ResearchTenderOut"][];
+            /** Total */
+            total: number;
+            /** Page */
+            page: number;
+            /** Page Size */
+            page_size: number;
+        };
+        /**
          * RestrictiveHintOut
          * @description Какое условие отсекает больше всего и сколько нашлось бы без него.
          */
@@ -1168,12 +1713,20 @@ export interface components {
             /** Depth */
             depth: number;
         };
-        /** RunFilterIn */
+        /**
+         * RunFilterIn
+         * @description Охват прогона: сроки и регионы. Критерий задан путём.
+         *
+         *     Регионы перекрывают структурные условия критерия, а не дополняют их:
+         *     выбранный охват должен совпадать с тем, что покажет воронка.
+         */
         RunFilterIn: {
             /** Since */
             since?: string | null;
-            /** Tender Ids */
-            tender_ids?: number[];
+            /** Until */
+            until?: string | null;
+            /** Regions */
+            regions?: string[];
         };
         /** SaveFilterIn */
         SaveFilterIn: {
@@ -1236,6 +1789,15 @@ export interface components {
             similarity: number;
             /** Driver */
             driver: string;
+        };
+        /** SliceOut */
+        SliceOut: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Count */
+            count: number;
         };
         /** TenderDetailOut */
         TenderDetailOut: {
@@ -1322,6 +1884,38 @@ export interface components {
              * @default 30
              */
             days: number;
+        };
+        /**
+         * TodayIngestOut
+         * @description Ход сегодняшней выгрузки.
+         *
+         *     `final` всегда `false`: суточный архив ЕИС дописывается до полуночи, и
+         *     сегодняшний день не считается закрытым никогда. Поле есть, чтобы клиент не
+         *     выводил это правило сам и не ошибся.
+         */
+        TodayIngestOut: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Runs Succeeded */
+            runs_succeeded: number;
+            /** Runs Failed */
+            runs_failed: number;
+            /** Runs Running */
+            runs_running: number;
+            /** Saved */
+            saved: number;
+            /** Published Today */
+            published_today: number;
+            /** Last Run At */
+            last_run_at: string | null;
+            /**
+             * Final
+             * @default false
+             */
+            final: boolean;
         };
         /** ValidationError */
         ValidationError: {
@@ -1415,8 +2009,10 @@ export interface operations {
                 documents_status?: ("pending" | "processing" | "done" | "partial" | "failed") | null;
                 /** @description Есть ли у закупки распознанный текст документов */
                 has_text?: boolean | null;
-                /** @description Только прошедшие LLM-фильтр */
+                /** @description Отбор по сохранённому фильтру */
                 filter_id?: number | null;
+                /** @description Какие вердикты фильтра показывать; по умолчанию — прошедшие */
+                filter_verdict?: ("confirmed" | "rejected" | "disputed")[] | null;
                 /** @description Номер страницы (offset-режим) */
                 page?: number;
                 page_size?: number;
@@ -1466,6 +2062,10 @@ export interface operations {
                 since?: string | null;
                 until?: string | null;
                 only_active?: boolean;
+                /** @description Отбор по сохранённому фильтру */
+                filter_id?: number | null;
+                /** @description Какие вердикты фильтра показывать; по умолчанию — прошедшие */
+                filter_verdict?: ("confirmed" | "rejected" | "disputed")[] | null;
                 /** @description Номер страницы (offset-режим) */
                 page?: number;
                 page_size?: number;
@@ -1520,6 +2120,8 @@ export interface operations {
                 /** @description Есть ли у закупки распознанный текст документов */
                 has_text?: boolean | null;
                 filter_id?: number | null;
+                /** @description Какие вердикты фильтра показывать; по умолчанию — прошедшие */
+                filter_verdict?: ("confirmed" | "rejected" | "disputed")[] | null;
                 /** @description Посчитать, какое условие отсекает больше всего */
                 explain_empty?: boolean;
             };
@@ -1568,6 +2170,8 @@ export interface operations {
                 /** @description Есть ли у закупки распознанный текст документов */
                 has_text?: boolean | null;
                 filter_id?: number | null;
+                /** @description Какие вердикты фильтра показывать; по умолчанию — прошедшие */
+                filter_verdict?: ("confirmed" | "rejected" | "disputed")[] | null;
             };
             header?: never;
             path?: never;
@@ -1677,6 +2281,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TenderEventsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    request_crawl_crawl_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CrawlIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobAcceptedOut"];
                 };
             };
             /** @description Validation Error */
@@ -2096,9 +2733,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["JobOut"];
                 };
             };
             /** @description Validation Error */
@@ -2570,6 +3205,134 @@ export interface operations {
             };
         };
     };
+    runs_research_runs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchRunOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_research_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchRunOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    tenders_research_runs__run_id__tenders_get: {
+        parameters: {
+            query?: {
+                confidence?: string | null;
+                page?: number;
+                page_size?: number;
+            };
+            header?: never;
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchTendersOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    market_research_runs__run_id__market_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MarketOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     services_health_monitoring_health_get: {
         parameters: {
             query?: never;
@@ -2692,6 +3455,58 @@ export interface operations {
             };
         };
     };
+    overview_data_overview_get: {
+        parameters: {
+            query?: {
+                days?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CorpusOverviewOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    processing_data_processing_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CorpusProcessingOut"];
+                };
+            };
+        };
+    };
     settings_settings_get: {
         parameters: {
             query?: never;
@@ -2730,6 +3545,59 @@ export interface operations {
             };
         };
     };
+    load_level_system_load_level_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadLevelOut"];
+                };
+            };
+        };
+    };
+    set_load_level_system_load_level_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoadLevelIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadLevelOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     health_health_get: {
         parameters: {
             query?: never;
@@ -2746,7 +3614,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        [key: string]: string;
+                        [key: string]: unknown;
                     };
                 };
             };
@@ -2768,7 +3636,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        [key: string]: string;
+                        [key: string]: unknown;
                     };
                 };
             };

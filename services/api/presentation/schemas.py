@@ -17,8 +17,10 @@ from services.api.domain.catalog import (
     RestrictiveHint,
     SimilarTender,
 )
+from services.api.domain.corpus import CorpusOverview, CorpusProcessing, Distribution
 from services.api.domain.documents import ChunkOutline, FragmentPage
 from services.api.domain.filters import SavedFilterCard
+from services.api.domain.jobs import JobView
 from services.api.domain.models import (
     DownloadLink,
     Page,
@@ -34,6 +36,13 @@ from services.api.domain.monitoring import (
     TenderEvent,
 )
 from services.api.domain.profile import RatingRecord, WinsSummary
+from services.api.domain.research import (
+    MarketView,
+    ResearchFunnel,
+    ResearchHitView,
+    ResearchRunCard,
+    ResearchTenderRow,
+)
 from services.api.domain.settings import EffectiveSettings
 
 
@@ -399,9 +408,71 @@ class FilterOut(BaseModel):
         )
 
 
-class RunFilterIn(BaseModel):
+class CrawlIn(BaseModel):
+    """Заявка на выгрузку.
+
+    Умолчание — вчера и сегодня: ЕИС публикует с задержкой, и вчерашний архив
+    к утру ещё дописывается. Пустые регионы означают «все настроенные у
+    краулера»: какие именно он качает, шлюз не знает.
+    """
+
     since: date | None = None
-    tender_ids: list[int] = Field(default_factory=list)
+    until: date | None = None
+    regions: list[str] = Field(default_factory=list)
+
+
+class JobAcceptedOut(BaseModel):
+    """Ответ на команду, которая исполняется не сразу."""
+
+    job_id: str
+
+
+class JobOut(BaseModel):
+    """Состояние длительной операции.
+
+    `total` намеренно допускает `null`: объём фазы известен не сразу — сборка
+    сводки узнаёт его после кластеризации, обход корпуса после подсчёта. Ноль
+    вместо `null` заставил бы клиента показать «0 %» там, где считать ещё
+    нечего, то есть выдумать число.
+    """
+
+    job_id: str
+    kind: str
+    status: str
+    phase: str | None = None
+    total: int | None = None
+    processed: int = 0
+    result: dict | None = None
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, job: JobView) -> JobOut:
+        return cls(
+            job_id=job.job_id,
+            kind=job.kind,
+            status=job.status,
+            phase=job.phase,
+            total=job.total,
+            processed=job.processed,
+            result=job.result,
+            error=job.error,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+        )
+
+
+class RunFilterIn(BaseModel):
+    """Охват прогона: сроки и регионы. Критерий задан путём.
+
+    Регионы перекрывают структурные условия критерия, а не дополняют их:
+    выбранный охват должен совпадать с тем, что покажет воронка.
+    """
+
+    since: date | None = None
+    until: date | None = None
+    regions: list[str] = Field(default_factory=list)
 
 
 class FeedbackIn(BaseModel):
@@ -557,6 +628,9 @@ class PipelineStageOut(BaseModel):
 class DocumentPipelineOut(BaseModel):
     funnel: list[PipelineStageOut]
     failures: list[PipelineStageOut]
+    #: Причины, по которым вложения не взяли. Объясняют разрыв между
+    #: «скачано» и «извлечён текст», который иначе выглядит поломкой.
+    skip_reasons: list[PipelineStageOut]
 
     @classmethod
     def of(cls, funnel: PipelineFunnel) -> DocumentPipelineOut:
@@ -571,6 +645,9 @@ class DocumentPipelineOut(BaseModel):
                 PipelineStageOut(stage="embedded", count=funnel.embedded),
             ],
             failures=[PipelineStageOut(stage=s, count=c) for s, c in funnel.failures],
+            skip_reasons=[
+                PipelineStageOut(stage=s, count=c) for s, c in funnel.skip_reasons
+            ],
         )
 
 
@@ -751,8 +828,9 @@ class LoadLevelIn(BaseModel):
 class LoadLevelOut(BaseModel):
     """Действующий уровень и потолки, которые из него следуют.
 
-    Потолки посчитаны для машины шлюза: у воркера с другим лимитом памяти
-    размер пула может отличаться, поэтому это справка, а не гарантия.
+    Потолки посчитаны по числу ядер. Поправку на память накладывает тот, кто
+    разбирает: у docs-worker свой лимит, и при тесном он опустит пул ниже.
+    Это справка о заявленном уровне, а не отчёт о применённом.
     """
 
     level: int
@@ -775,4 +853,319 @@ class LoadLevelOut(BaseModel):
             llm_concurrency=budget.llm_concurrency,
             eis_rps=budget.eis_rps,
             omp_threads=budget.omp_threads,
+        )
+
+
+# ─── Исследования ─────────────────────────────────────────────────────────────
+
+
+class ResearchFunnelOut(BaseModel):
+    """Воронка прогона — ветвление, а не каскад.
+
+    `documents_pending` и `not_reached` отдаются всегда, даже нулями: это
+    знаменатели. «Находок нет» читается только рядом с «прочитано столько-то»,
+    а «спорных 8, решено 5» — рядом с «до трёх не дошли».
+    """
+
+    tenders_total: int
+    tenders_candidate: int
+    documents_scanned: int
+    documents_pending: int
+    hits_found: int
+    reviewed: int
+    rejected_by_rules: int
+    confirmed_by_rules: int
+    disputed: int
+    from_cache: int
+    asked_model: int
+    not_reached: int
+    failed: int
+
+    @classmethod
+    def of(cls, funnel: ResearchFunnel) -> ResearchFunnelOut:
+        return cls(**{field: getattr(funnel, field) for field in cls.model_fields})
+
+
+class ResearchRunOut(BaseModel):
+    run_id: int
+    name: str
+    criteria_version: str
+    status: str
+    regions: list[str]
+    date_from: date | None
+    date_to: date | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_message: str | None
+    confirmed: int
+    rejected: int
+    funnel: ResearchFunnelOut
+
+    @classmethod
+    def of(cls, card: ResearchRunCard) -> ResearchRunOut:
+        return cls(
+            run_id=card.run_id,
+            name=card.name,
+            criteria_version=card.criteria_version,
+            status=card.status,
+            regions=card.regions,
+            date_from=card.date_from,
+            date_to=card.date_to,
+            started_at=card.started_at,
+            finished_at=card.finished_at,
+            error_message=card.error_message,
+            confirmed=card.confirmed,
+            rejected=card.rejected,
+            funnel=ResearchFunnelOut.of(card.funnel),
+        )
+
+
+class ResearchHitOut(BaseModel):
+    """Цитата вместе с границами совпадения внутри неё.
+
+    Границы — не украшение: без них обрезка длинной цитаты показывает один
+    левый контекст, и совпадение оказывается за кадром.
+    """
+
+    term: str
+    role: str
+    quote: str
+    match_start: int
+    match_end: int
+    file_name: str | None
+    page: int | None
+
+    @classmethod
+    def of(cls, hit: ResearchHitView) -> ResearchHitOut:
+        """Поля перечислены поимённо намеренно.
+
+        `vars(hit)` здесь падал: доменная цитата объявлена со `slots=True` и
+        `__dict__` у неё нет. Перенос по именам заодно не даёт новому полю
+        домена молча просочиться наружу — контракт расширяют осознанно.
+        """
+        return cls(
+            term=hit.term,
+            role=hit.role,
+            quote=hit.quote,
+            match_start=hit.match_start,
+            match_end=hit.match_end,
+            file_name=hit.file_name,
+            page=hit.page,
+        )
+
+
+class ResearchTenderOut(BaseModel):
+    tender_id: int
+    reg_num: str
+    name: str | None
+    price: Decimal | None
+    region_code: str | None
+    customer_name: str | None
+    customer_inn: str | None
+    okpd2_code: str | None
+    confidence: str
+    reason: str | None
+    decided_by: str
+    score: float
+    hits: list[ResearchHitOut]
+
+    @classmethod
+    def of(cls, row: ResearchTenderRow) -> ResearchTenderOut:
+        return cls(
+            tender_id=row.tender_id,
+            reg_num=row.reg_num,
+            name=row.name,
+            price=row.price,
+            region_code=row.region_code,
+            customer_name=row.customer_name,
+            customer_inn=row.customer_inn,
+            okpd2_code=row.okpd2_code,
+            confidence=row.confidence,
+            reason=row.reason,
+            decided_by=row.decided_by,
+            score=row.score,
+            hits=[ResearchHitOut.of(hit) for hit in row.hits],
+        )
+
+
+class ResearchTendersOut(BaseModel):
+    items: list[ResearchTenderOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class MarketBucketOut(BaseModel):
+    key: str
+    label: str
+    count: int
+    total: Decimal
+    average: Decimal | None
+
+
+class MarketOut(BaseModel):
+    """Разрезы рынка.
+
+    `median_price` отдаётся рядом со `average_price`, а не вместо: у НМЦК
+    тяжёлый правый хвост, и одно среднее описывает рынок, которого нет.
+    `top_share` показывает этот хвост числом.
+    """
+
+    total_count: int
+    priced_count: int
+    total_value: Decimal
+    median_price: Decimal | None
+    average_price: Decimal | None
+    top_share: float
+    by_region: list[MarketBucketOut]
+    by_customer: list[MarketBucketOut]
+    by_okpd2: list[MarketBucketOut]
+
+    @classmethod
+    def of(cls, view: MarketView) -> MarketOut:
+        bucket = lambda b: MarketBucketOut(  # noqa: E731
+            key=b.key, label=b.label, count=b.count, total=b.total, average=b.average
+        )
+        return cls(
+            total_count=view.total_count,
+            priced_count=view.priced_count,
+            total_value=view.total_value,
+            median_price=view.median_price,
+            average_price=view.average_price,
+            top_share=view.top_share,
+            by_region=[bucket(b) for b in view.by_region],
+            by_customer=[bucket(b) for b in view.by_customer],
+            by_okpd2=[bucket(b) for b in view.by_okpd2],
+        )
+
+
+# ─── Вкладка «Данные» ─────────────────────────────────────────────────────────
+
+
+class DayBucketOut(BaseModel):
+    """День на гистограмме публикаций.
+
+    `crawled` отличает «в этот день ничего не публиковали» от «этот день мы не
+    выгружали». Без этого различия дыра в покрытии читалась бы как факт о
+    рынке.
+    """
+
+    day: date
+    count: int
+    crawled: bool
+
+
+class SliceOut(BaseModel):
+    key: str
+    label: str
+    count: int
+
+
+class DistributionOut(BaseModel):
+    """Верхушка разреза плюс хвост.
+
+    `others` и `unknown` обязательны: сумма показанного, хвоста и «без
+    признака» равна `total`. Без них двенадцать столбиков читаются как весь
+    корпус.
+    """
+
+    top: list[SliceOut]
+    others: int
+    unknown: int
+    total: int
+
+    @classmethod
+    def of(cls, distribution: Distribution) -> DistributionOut:
+        return cls(
+            top=[SliceOut(key=s.key, label=s.label, count=s.count) for s in distribution.top],
+            others=distribution.others,
+            unknown=distribution.unknown,
+            total=distribution.total,
+        )
+
+
+class CorpusOverviewOut(BaseModel):
+    """Состав корпуса за период. Период один на все разрезы — см. use case."""
+
+    since: date
+    until: date
+    total: int
+    total_all_time: int
+    earliest: date | None
+    latest: date | None
+    by_day: list[DayBucketOut]
+    by_region: DistributionOut
+    by_okpd2: DistributionOut
+
+    @classmethod
+    def of(cls, view: CorpusOverview) -> CorpusOverviewOut:
+        return cls(
+            since=view.since,
+            until=view.until,
+            total=view.total,
+            total_all_time=view.total_all_time,
+            earliest=view.earliest,
+            latest=view.latest,
+            by_day=[
+                DayBucketOut(day=d.day, count=d.count, crawled=d.crawled) for d in view.by_day
+            ],
+            by_region=DistributionOut.of(view.by_region),
+            by_okpd2=DistributionOut.of(view.by_okpd2),
+        )
+
+
+class EmbeddingProgressOut(BaseModel):
+    chunks_total: int
+    chunks_embedded: int
+    tenders_total: int
+    tenders_embedded: int
+    #: `null` — брокер не ответил. Это факт о брокере, а не ноль работы.
+    queue_depth: int | None
+
+
+class TodayIngestOut(BaseModel):
+    """Ход сегодняшней выгрузки.
+
+    `final` всегда `false`: суточный архив ЕИС дописывается до полуночи, и
+    сегодняшний день не считается закрытым никогда. Поле есть, чтобы клиент не
+    выводил это правило сам и не ошибся.
+    """
+
+    day: date
+    runs_succeeded: int
+    runs_failed: int
+    runs_running: int
+    saved: int
+    published_today: int
+    last_run_at: datetime | None
+    final: bool = False
+
+
+class CorpusProcessingOut(BaseModel):
+    embeddings: EmbeddingProgressOut
+    today: TodayIngestOut
+    documents_downloaded: int
+    documents_extracted: int
+
+    @classmethod
+    def of(cls, view: CorpusProcessing) -> CorpusProcessingOut:
+        return cls(
+            embeddings=EmbeddingProgressOut(
+                chunks_total=view.embeddings.chunks_total,
+                chunks_embedded=view.embeddings.chunks_embedded,
+                tenders_total=view.embeddings.tenders_total,
+                tenders_embedded=view.embeddings.tenders_embedded,
+                queue_depth=view.embeddings.queue_depth,
+            ),
+            today=TodayIngestOut(
+                day=view.today.day,
+                runs_succeeded=view.today.runs_succeeded,
+                runs_failed=view.today.runs_failed,
+                runs_running=view.today.runs_running,
+                saved=view.today.saved,
+                published_today=view.today.published_today,
+                last_run_at=view.today.last_run_at,
+            ),
+            documents_downloaded=view.documents_downloaded,
+            documents_extracted=view.documents_extracted,
         )

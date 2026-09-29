@@ -9,7 +9,13 @@ from __future__ import annotations
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from libs.shared.db.schema import DocumentText, LlmVerdict, Tender, TenderDocument
+from libs.shared.db.schema import (
+    DocumentText,
+    ResearchHit,
+    ResearchVerdict,
+    Tender,
+    TenderDocument,
+)
 from services.api.application.ports.catalog import TenderCatalogPort
 from services.api.domain.models import (
     Page,
@@ -92,15 +98,37 @@ class SqlCatalogRepository(TenderCatalogPort):
                 )
             ).all()
 
+            # Вердикты движка отбора, а не прежнего движка фильтров: тот
+            # удалён, и его таблица больше не наполняется.
             verdict_rows = (
                 await session.execute(
                     select(
-                        LlmVerdict.filter_id,
-                        LlmVerdict.match,
-                        LlmVerdict.score,
-                        LlmVerdict.reasoning,
-                        LlmVerdict.evidence,
-                    ).where(LlmVerdict.tender_id == row.id)
+                        ResearchVerdict.criteria_version,
+                        ResearchVerdict.confidence,
+                        ResearchVerdict.reason,
+                        ResearchVerdict.score,
+                        ResearchVerdict.decided_by,
+                    )
+                    .where(ResearchVerdict.tender_id == row.id)
+                    .order_by(ResearchVerdict.created_at.desc())
+                )
+            ).all()
+
+            # Цитаты живут отдельно от вердикта: они принадлежат прогону, а
+            # вердикт — паре «закупка + критерий». Показываем последние.
+            hit_rows = (
+                await session.execute(
+                    select(
+                        ResearchHit.term,
+                        ResearchHit.quote,
+                        ResearchHit.match_start,
+                        ResearchHit.match_end,
+                        ResearchHit.file_name,
+                        ResearchHit.page,
+                    )
+                    .where(ResearchHit.tender_id == row.id)
+                    .order_by(ResearchHit.id.desc())
+                    .limit(5)
                 )
             ).all()
 
@@ -122,11 +150,27 @@ class SqlCatalogRepository(TenderCatalogPort):
             ],
             verdicts=[
                 {
-                    "filter_id": v.filter_id,
-                    "match": v.match,
+                    "criteria_version": v.criteria_version,
+                    "confidence": v.confidence,
+                    "reason": v.reason,
                     "score": v.score,
-                    "reasoning": v.reasoning,
-                    "evidence": v.evidence,
+                    # Видно, во что обошлось решение: правила бесплатны,
+                    # модель — нет.
+                    "decided_by": v.decided_by,
+                    # Цитаты общие на закупку: вердикт ссылается на находки, а
+                    # находки принадлежат прогону. Разложить их по вердиктам
+                    # значило бы придумать связь, которой в данных нет.
+                    "hits": [
+                        {
+                            "term": h.term,
+                            "quote": h.quote,
+                            "match_start": h.match_start,
+                            "match_end": h.match_end,
+                            "file_name": h.file_name,
+                            "page": h.page,
+                        }
+                        for h in hit_rows
+                    ],
                 }
                 for v in verdict_rows
             ],

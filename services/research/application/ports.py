@@ -59,26 +59,40 @@ class ModelJudgePort(ABC):
     def model_name(self) -> str: ...
 
 
-class VerdictCachePort(ABC):
-    """Кэш решений модели.
+class VerdictStorePort(ABC):
+    """Хранилище решений по закупкам — и кэш, и источник истины сразу.
 
     Ключ — закупка вместе с версиями критериев и промпта: правка любой из них
     обязана обесценить прежние решения, а не смешаться с ними.
+
+    Это не кэш, хотя когда-то задумывался им. Отсюда читает
+    `libs/shared/db/tender_criteria.py`, отбирая закупки по сохранённому
+    фильтру: удаление строк здесь удаляет строки из выдачи каталога. Ничего
+    похожего на TTL, «очистить» или «пропустить при бэкапе» тут появляться не
+    должно — прежнее название однажды уже спровоцировало ровно обратное
+    ожидание, и вердикты правил не сохранялись вовсе.
     """
 
     @abstractmethod
-    async def cached(
+    async def stored(
         self, tender_ids: Sequence[int], criteria_version: str, prompt_version: str
     ) -> dict[int, TenderVerdict]: ...
 
     @abstractmethod
     async def save(
         self,
-        verdict: TenderVerdict,
+        verdicts: Sequence[TenderVerdict],
         criteria_version: str,
         prompt_version: str,
         model: str,
-    ) -> None: ...
+    ) -> None:
+        """Сохраняет решения пачкой.
+
+        `model` проставляется только строкам с `decided_by == "model"`: у
+        решения правил модели нет, и `model IS NULL` честно означает «это
+        решение ничего не стоило».
+        """
+        ...
 
 
 @dataclass(slots=True)
@@ -123,6 +137,18 @@ class ScanStats:
     candidates: list[TenderCandidate] = field(default_factory=list)
 
 
+class ProgressPort(ABC):
+    """Куда сообщать, как далеко зашёл прогон.
+
+    Прогон идёт минутами, а на полном корпусе часами. Пока числа не доезжали до
+    экрана, форма запуска показывала бесконечный волчок — то есть была
+    неотличима от зависшей.
+    """
+
+    @abstractmethod
+    async def report(self, processed: int, total: int) -> None: ...
+
+
 class CorpusPort(ABC):
     """Чтение накопленного корпуса закупок и документов."""
 
@@ -140,14 +166,6 @@ class CorpusPort(ABC):
         self, regions: Sequence[str] | None, since: date | None, until: date | None
     ) -> int: ...
 
-    @abstractmethod
-    async def count_unscanned(
-        self, regions: Sequence[str] | None, since: date | None, until: date | None
-    ) -> int:
-        """Сколько документов ещё не разобрано — знаменатель воронки.
-
-        Без него «находок нет» неотличимо от «ничего не читали».
-        """
 
 
 class TextStoragePort(ABC):
@@ -180,3 +198,12 @@ class ResearchRunPort(ABC):
     async def finish(
         self, run_id: int, confirmed: int, rejected: int, disputed: int
     ) -> None: ...
+
+    @abstractmethod
+    async def fail(self, run_id: int, error: str) -> None:
+        """Помечает прогон упавшим.
+
+        Без этого карточка прогона вечно показывает «идёт», а воронка застывает
+        на числах середины обхода — как будто прогон просто ничего не нашёл.
+        """
+        ...

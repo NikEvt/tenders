@@ -13,6 +13,8 @@ from services.api.application.ports.catalog import (
     TenderSearchPort,
     TenderSimilarityPort,
 )
+from services.api.application.ports.corpus import CorpusStatsPort
+from services.api.application.ports.crawl import CrawlPublisherPort
 from services.api.application.ports.digest import DigestReadPort
 from services.api.application.ports.documents import DocumentReadPort, FragmentSearchPort
 from services.api.application.ports.downstream import LlmServicePort, RecsysServicePort
@@ -29,10 +31,13 @@ from services.api.application.ports.monitoring import (
 )
 from services.api.application.ports.profile import ProfileHistoryPort
 from services.api.application.ports.registry import Ports
+from services.api.application.ports.research import ResearchReadPort
 from services.api.application.ports.settings import RuntimeSettingsPort
 
 __all__ = [
     "AppStatePort",
+    "CorpusStatsPort",
+    "CrawlPublisherPort",
     "CrawlerRunReadPort",
     "DigestReadPort",
     "DocumentPipelinePort",
@@ -48,6 +53,7 @@ __all__ = [
     "QueueAdminPort",
     "ReadinessPort",
     "RecsysServicePort",
+    "ResearchReadPort",
     "RuntimeSettingsPort",
     "ServiceProbePort",
     "TenderCatalogPort",

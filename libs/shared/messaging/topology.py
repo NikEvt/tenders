@@ -34,11 +34,22 @@ MAX_RETRY_ATTEMPTS = len(RETRY_DELAYS_MS)
 
 @dataclass(frozen=True)
 class QueueSpec:
-    """Описание очереди потребителя: имя + на какие routing key она подписана."""
+    """Описание очереди потребителя: имя, подписки и лестница повторов.
+
+    Задержки живут здесь, а не глобальной константой, потому что объявляются
+    они per-queue — через `x-message-ttl` каждой retry-очереди. Заодно это
+    даёт тестам короткую лестницу: проверять надо, что повтор случился и в
+    правильном порядке, а не что RabbitMQ умеет ждать пять секунд.
+    """
 
     name: str
     routing_keys: tuple[str, ...]
     prefetch: int = 8
+    retry_delays_ms: tuple[int, ...] = RETRY_DELAYS_MS
+
+    @property
+    def max_attempts(self) -> int:
+        return len(self.retry_delays_ms)
 
     def retry_queue(self, attempt: int) -> str:
         return f"{self.name}.retry.{attempt}"
@@ -77,7 +88,7 @@ async def declare_consumer_queues(channel: AbstractChannel, spec: QueueSpec) -> 
     # Возврат из retry-лестницы идёт по routing key, равному имени очереди.
     await work.bind(retry_exchange, routing_key=spec.name)
 
-    for attempt, delay_ms in enumerate(RETRY_DELAYS_MS):
+    for attempt, delay_ms in enumerate(spec.retry_delays_ms):
         retry = await channel.declare_queue(
             spec.retry_queue(attempt),
             durable=True,

@@ -711,3 +711,46 @@ async def test_deferred_and_final_skips_are_distinguishable(
     assert by_id["CONTRACT"].skip_reason == "low_priority"
 
     assert by_id["TZ"].extraction_status == ExtractionStatus.DONE.value
+
+
+@pytest.mark.asyncio
+async def test_document_with_thousands_of_chunks_survives(
+    session_factory, tender_with_attachments
+) -> None:
+    """Крупная смета даёт тысячи чанков — вставка обязана их пережить.
+
+    У asyncpg потолок 32767 параметров на запрос, у чанка девять колонок, то
+    есть около 3640 строк. Одна вставка на весь документ переполняла его, и
+    документ падал целиком с `the number of query arguments cannot exceed
+    32767`. Числа здесь подобраны так, чтобы перешагнуть этот предел.
+    """
+    url = "https://zakupki.gov.ru/file?uid=HUGE"
+    # Чанкер режет по 200 символов с шагом ~159 — на 4000+ чанков нужно ~700 тыс.
+    # символов. Меньше не годится: тест обязан перешагнуть предел, а не подойти
+    # к нему близко, иначе он зелёный и при сломанной пакетной вставке.
+    body = ("Позиция сметы: труба стальная 57х3.5, ГОСТ 10704-91. " * 14000).encode()
+
+    tender_id = await tender_with_attachments(
+        [{"attachment_id": "HUGE", "file_name": "Смета.txt", "source_url": url}]
+    )
+
+    use_case = build_use_case(
+        session_factory, StubDownloader({url: body}), InMemoryStorage(), RecordingPublisher()
+    )
+    await use_case.execute(
+        TenderIngested(tender_id=tender_id, reg_num=REG_NUM, is_new=True, attachment_count=1)
+    )
+
+    async with session_factory() as session:
+        document = await session.scalar(
+            select(TenderDocument).where(TenderDocument.tender_id == tender_id)
+        )
+        count = await session.scalar(
+            select(func.count())
+            .select_from(DocumentChunk)
+            .where(DocumentChunk.document_id == document.id)
+        )
+
+    assert document.extraction_status == ExtractionStatus.DONE.value
+    # Больше предела в одну вставку — значит пачки действительно понадобились.
+    assert count > 3640, f"чанков {count}: тест не дотянул до предела asyncpg"

@@ -8,7 +8,11 @@
 Три свойства, без которых прогон на тысячах закупок нерабочий.
 
 **Кэш.** Повторный прогон не тратит токенов: решение помнится по закупке вместе
-с версиями критериев и промпта.
+с версиями критериев и промпта. Сохраняются при этом **все** решения, а не
+только купленные у модели: по этой же таблице каталог отбирает закупки по
+сохранённому фильтру, а правила решают большинство. Когда-то писались только
+ответы модели — и 48 подтверждений из 56 на размеченном наборе в выдачу не
+попадали вовсе.
 
 **Потолок одновременности.** Берётся из уровня нагрузки: на фоновом уровне
 модель дёргают по одной закупке, на полном — по восемь.
@@ -30,9 +34,10 @@ from libs.shared.logging import get_logger
 from services.research.application.ports import (
     ModelJudgePort,
     ModelUnavailable,
+    ProgressPort,
     TenderCandidate,
     TenderVerdict,
-    VerdictCachePort,
+    VerdictStorePort,
 )
 from services.research.application.prompts import (
     JUDGE_SYSTEM,
@@ -113,13 +118,17 @@ class JudgeDisputedUseCase:
         self,
         criteria: Criteria,
         model: ModelJudgePort,
-        cache: VerdictCachePort | None = None,
+        store: VerdictStorePort | None = None,
         concurrency: int = 1,
+        dry_run: bool = False,
+        progress: ProgressPort | None = None,
     ) -> None:
         self._criteria = criteria
         self._model = model
-        self._cache = cache
+        self._store = store
         self._limit = AdjustableSemaphore(concurrency)
+        self._dry_run = dry_run
+        self._progress = progress
 
     async def set_concurrency(self, concurrency: int) -> None:
         await self._limit.resize(concurrency)
@@ -149,14 +158,19 @@ class JudgeDisputedUseCase:
                 )
             )
 
+        # Решения правил сохраняются здесь, а не в конце: ниже стоит ранний
+        # возврат, а прогонов без спорных закупок на реальном корпусе
+        # большинство — сохранение «в самом конце» промахнулось бы мимо них.
+        await self._persist(outcome.verdicts)
+
         outcome.funnel.disputed = len(disputed)
         if not disputed:
             return outcome
 
-        cached = await self._load_cache([c.tender_id for c in disputed])
+        stored = await self._load_stored([c.tender_id for c in disputed])
         pending = []
         for candidate in disputed:
-            found = cached.get(candidate.tender_id)
+            found = stored.get(candidate.tender_id)
             if found is None:
                 pending.append(candidate)
                 continue
@@ -175,11 +189,24 @@ class JudgeDisputedUseCase:
         )
         return outcome
 
-    async def _load_cache(self, tender_ids: Sequence[int]) -> dict[int, TenderVerdict]:
-        if self._cache is None:
+    async def _load_stored(self, tender_ids: Sequence[int]) -> dict[int, TenderVerdict]:
+        if self._store is None:
             return {}
-        return await self._cache.cached(
+        return await self._store.stored(
             tender_ids, self._criteria.version, JUDGE_PROMPT_VERSION
+        )
+
+    async def _persist(self, verdicts: Sequence[TenderVerdict]) -> None:
+        """Единственное место, где вердикт становится строкой в базе.
+
+        Пробный прогон (`dry_run`) сюда не пишет: вердикт принадлежит паре
+        «закупка + критерий», а не прогону, и отличить пробный от настоящего
+        отбор по сохранённому фильтру уже не сможет.
+        """
+        if self._store is None or self._dry_run or not verdicts:
+            return
+        await self._store.save(
+            verdicts, self._criteria.version, JUDGE_PROMPT_VERSION, self._model.model_name
         )
 
     async def _ask_model(
@@ -212,7 +239,20 @@ class JudgeDisputedUseCase:
                     )
                     return _Attempt(_Status.FAILED)
 
-        for attempt in await asyncio.gather(*(judge_one(c) for c in candidates)):
+        total = len(candidates)
+        # Открывающий доклад — до первого обращения к модели. Он и переводит
+        # задание в фазу судьи: иначе экран показывал бы законченный обход
+        # корпуса до тех пор, пока не вернётся первый вердикт, то есть минуту
+        # и больше.
+        await self._report(0, total)
+
+        # `as_completed`, а не `gather`: докладывать о ходе по мере готовности —
+        # весь смысл. `gather` отдаёт результаты одним списком в конце, и шкала
+        # прыгала бы с нуля сразу на сто.
+        for done, task in enumerate(
+            asyncio.as_completed([judge_one(c) for c in candidates]), start=1
+        ):
+            attempt = await task
             if attempt.status is _Status.FAILED:
                 outcome.funnel.failed += 1
             elif attempt.status is _Status.NOT_REACHED:
@@ -221,7 +261,25 @@ class JudgeDisputedUseCase:
                 outcome.funnel.asked_model += 1
                 outcome.verdicts.append(attempt.verdict)
 
+            await self._report(done, total)
+
         outcome.interrupted = stopped.is_set()
+
+    async def _report(self, processed: int, total: int) -> None:
+        """Докладывает о ходе разбора.
+
+        Шаг мельче, чем у обхода корпуса, и намеренно: спорных закупок сотни, а
+        не сотни тысяч, зато каждая стоит обращения к модели — здесь дорога
+        единица работы, а не запись о ней.
+        """
+        if self._progress is None:
+            return
+        try:
+            await self._progress.report(processed, total)
+        except Exception as exc:
+            # Отчёт о ходе — вспомогательное: ронять из-за него разбор нельзя.
+            # Тот же порядок, что у обхода корпуса.
+            log.warning("research.progress_failed", error=str(exc))
 
     async def _judge(self, candidate: TenderCandidate) -> TenderVerdict:
         # В модель уходят только основные находки: вспомогательные ничего не
@@ -253,10 +311,9 @@ class JudgeDisputedUseCase:
             evidence=evidence,
         )
 
-        if self._cache is not None:
-            await self._cache.save(
-                result, self._criteria.version, JUDGE_PROMPT_VERSION, self._model.model_name
-            )
+        # Каждый ответ модели сохраняется сразу, а не пачкой в конце прогона:
+        # иначе падение посреди очереди заставило бы покупать их заново.
+        await self._persist([result])
         return result
 
 

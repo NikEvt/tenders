@@ -23,6 +23,7 @@ from services.research.application.ports import (
     CorpusPort,
     CorpusTender,
     HitRepositoryPort,
+    ProgressPort,
     ResearchRunPort,
     ScanStats,
     TenderCandidate,
@@ -32,6 +33,9 @@ from services.research.domain.criteria import Criteria
 from services.research.domain.hits import Hit, find_hits, is_card_candidate
 
 log = get_logger(__name__)
+
+#: Через сколько закупок докладывать о ходе.
+PROGRESS_STEP = 50
 
 
 class ScanCorpusUseCase:
@@ -49,6 +53,7 @@ class ScanCorpusUseCase:
         hits: HitRepositoryPort | None = None,
         runs: ResearchRunPort | None = None,
         readers: int = 4,
+        progress: ProgressPort | None = None,
     ) -> None:
         self._criteria = criteria
         self._corpus = corpus
@@ -56,6 +61,8 @@ class ScanCorpusUseCase:
         self._hits = hits
         self._runs = runs
         self._readers = max(int(readers), 1)
+        self._progress = progress
+        self._reported: int | None = None
 
     async def execute(
         self,
@@ -68,8 +75,13 @@ class ScanCorpusUseCase:
         stats.tenders_total = await self._corpus.count_tenders(regions, since, until)
 
         limit = asyncio.Semaphore(self._readers)
+        seen = 0
+        await self._report(0, stats.tenders_total)
 
         async for tender in self._corpus.tenders(regions, since, until):
+            seen += 1
+            await self._report(seen, stats.tenders_total)
+
             # Предфильтр по карточке: скачивать и читать документы всех
             # извещений невозможно, а упоминание в большинстве из них
             # невозможно по смыслу.
@@ -104,7 +116,7 @@ class ScanCorpusUseCase:
             if self._hits is not None and run_id is not None:
                 await self._hits.save(run_id, tender.tender_id, hits)
 
-        stats.documents_pending = await self._corpus.count_unscanned(regions, since, until)
+        await self._report(stats.tenders_total, stats.tenders_total)
 
         if self._runs is not None and run_id is not None:
             await self._runs.update_funnel(run_id, stats)
@@ -118,6 +130,27 @@ class ScanCorpusUseCase:
             hits=stats.hits_found,
         )
         return stats
+
+    async def _report(self, processed: int, total: int) -> None:
+        """Докладывает о ходе — редко.
+
+        Запись в базу на каждую закупку при корпусе в сотни тысяч строк была бы
+        самодельной проблемой с нагрузкой, поэтому шаг крупный, а первый и
+        последний доклады идут всегда: без них полоса не появится и не закроется.
+        """
+        if self._progress is None:
+            return
+        if processed not in (0, total) and processed % PROGRESS_STEP:
+            return
+        if processed == self._reported:
+            # Закрывающий доклад совпал с последним из цикла — повторять незачем.
+            return
+        self._reported = processed
+        try:
+            await self._progress.report(processed, total)
+        except Exception as exc:
+            # Отчёт о ходе — вспомогательное: ронять из-за него прогон нельзя.
+            log.warning("research.progress_failed", error=str(exc))
 
     async def _scan_tender(
         self, tender: CorpusTender, stats: ScanStats, limit: asyncio.Semaphore
@@ -142,6 +175,15 @@ class ScanCorpusUseCase:
 
     async def _scan_document(self, document: CorpusDocument, stats: ScanStats) -> list[Hit]:
         if not document.text_key:
+            # Знаменатель считается здесь, а не отдельным запросом к базе.
+            # Прежний `count_unscanned` применял только период и структурные
+            # условия, но не предфильтр по карточке, — то есть считал документы
+            # всего корпуса, тогда как `documents_scanned` считал документы
+            # одних кандидатов. На живом прогоне это давало 92 против 2340 там,
+            # где сопоставимая пара — 92 против 31: «прочитали 4%» вместо
+            # «прочитали 75%». Оба числа обязаны выходить из одного обхода по
+            # одной популяции, иначе они разойдутся снова.
+            stats.documents_pending += 1
             return []
         try:
             text = await self._texts.read(document.text_key)

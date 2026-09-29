@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -103,15 +104,48 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+#: Насколько долго верить однажды подтверждённой готовности, секунд.
+#:
+#: Проба готовности прогоняет через модель короткий текст — иначе «готов»
+#: означало бы лишь «объект создан». Но делать это на каждый опрос нельзя:
+#: инференс встаёт в очередь за настоящей работой, и время ответа зависит от
+#: загрузки, а не от исправности.
+#:
+#: Замер: на MPS при разборе очереди `/health/ready` отвечал 0.66–2.75 с при
+#: потолке пробы шлюза в 1.5 с — то есть сервис объявлялся то живым, то мёртвым
+#: по жребию. На CPU в контейнере то же самое упиралось в 30 с и давало
+#: сплошные таймауты. Проверять исправность вычислением, конкурирующим с
+#: полезной нагрузкой, — значит мерить занятость и называть её поломкой.
+READY_CACHE_SECONDS = 60.0
+
+_verified_at: float | None = None
+
+
 @app.get("/health/ready")
 async def ready() -> dict[str, object]:
+    """Готовность: модель загружена и выдаёт векторы.
+
+    Прогон делается один раз и повторяется не чаще, чем раз в минуту. В
+    промежутке отдаётся тот же факт — он не перестаёт быть верным оттого, что
+    сервис занят.
+    """
+    global _verified_at
     current = container()
-    # Прогон короткого текста подтверждает, что модель действительно загружена,
-    # а не просто объявлена.
-    await asyncio.wait_for(current.embedder.embed(["ping"]), timeout=30)
+
+    now = time.monotonic()
+    if _verified_at is None or now - _verified_at > READY_CACHE_SECONDS:
+        # Первая проверка после старта самая дорогая: модель прогревается.
+        vectors = await asyncio.wait_for(current.embedder.embed(["ping"]), timeout=120)
+        if not vectors or len(vectors[0]) != current.embedder.dim:
+            raise HTTPException(status_code=503, detail="Модель вернула вектор не той длины")
+        _verified_at = time.monotonic()
+
     return {
         "status": "ready",
         "model": current.embedder.model_name,
         "dim": current.embedder.dim,
         "device": current.embedder.device,
+        # Видно, насколько свеж факт: «готов» из кэша минутной давности — это
+        # не то же самое, что проверка прямо сейчас.
+        "verified_ago_s": round(time.monotonic() - _verified_at, 1),
     }

@@ -12,13 +12,23 @@ from services.docs_worker.backfill_offsets import backfill
 
 PREFIX = "TEST-FRAG-"
 
+# Слово-маркер в тексте фикстуры. Раньше тесты искали «хлоргексидин» — слово
+# редкое, но настоящее: в выгрузке его набралось 25 чанков, выдача ограничена
+# размером страницы, и фикстура перестала в неё попадать. Тест падал от роста
+# данных, а не от поломки. Маркер вымышленный, встретиться в ЕИС не может.
+#
+# В запросе он в именительном, в тексте — в творительном: морфология остаётся
+# частью проверки. Русский стеммер сводит обе формы к «хлоргексидинтестфраг».
+MARKER = "хлоргексидинтестфраг"
+MARKER_FORM = "хлоргексидинтестфрагом"
+
 CONTENT = (
-    "Мебель  должна выдерживать обработку хлоргексидином.\n\n"
+    f"Мебель  должна выдерживать обработку {MARKER_FORM}.\n\n"
     "Гарантия на изделия составляет не менее трёх лет."
 )
 # Первый чанк записан так, как его нарезал прежний чанкер: пробелы схлопнуты,
 # и подстрокой документа он не является.
-OLD_STYLE_CHUNK = "Мебель должна выдерживать обработку хлоргексидином."
+OLD_STYLE_CHUNK = f"Мебель должна выдерживать обработку {MARKER_FORM}."
 SECOND_CHUNK = "Гарантия на изделия составляет не менее трёх лет."
 
 
@@ -89,7 +99,7 @@ async def test_backfill_aligns_old_chunks_to_the_document(session_factory, docum
     # Границы указывают на настоящий текст документа.
     first = chunks[0]
     assert CONTENT[first.char_start : first.char_end].startswith("Мебель")
-    assert CONTENT[first.char_start : first.char_end].endswith("хлоргексидином.")
+    assert CONTENT[first.char_start : first.char_end].endswith(f"{MARKER_FORM}.")
 
     second = chunks[1]
     assert CONTENT[second.char_start : second.char_end] == SECOND_CHUNK
@@ -121,13 +131,13 @@ def fragments(session_factory) -> SqlFragmentRepository:
 
 @pytest.mark.asyncio
 async def test_lexical_search_returns_the_fragment_itself(session_factory, document) -> None:
-    page = await fragments(session_factory).search("хлоргексидином", "lexical", 0, 20)
+    page = await fragments(session_factory).search(MARKER, "lexical", 0, 20)
 
     ours = [f for f in page.items if f.reg_num.startswith(PREFIX)]
     assert len(ours) == 1
     found = ours[0]
     # Единица выдачи — фрагмент, а не закупка: есть сам текст и его источник.
-    assert "хлоргексидином" in found.text
+    assert MARKER_FORM in found.text
     assert found.document_name == "ТЗ.pdf"
     assert found.tender_name == "Поставка офисной мебели"
     assert found.scores.lexical is not None
@@ -136,32 +146,27 @@ async def test_lexical_search_returns_the_fragment_itself(session_factory, docum
 
 @pytest.mark.asyncio
 async def test_highlights_point_inside_the_fragment_text(session_factory, document) -> None:
-    """Запрос в начальной форме, в тексте — падеж: подсветка обязана попасть.
-
-    Термин выбран редкий намеренно. Выдача ограничена размером пула, и на
-    настоящем объёме документов частотное слово вытеснило бы фикстуру за его
-    пределы — тест падал бы от роста данных, а не от поломки.
-    """
-    page = await fragments(session_factory).search("хлоргексидин", "lexical", 0, 20)
+    """Запрос в начальной форме, в тексте — падеж: подсветка обязана попасть."""
+    page = await fragments(session_factory).search(MARKER, "lexical", 0, 20)
 
     ours = [f for f in page.items if f.reg_num.startswith(PREFIX)]
     assert ours
     found = ours[0]
     assert found.highlights
     start, end = found.highlights[0]
-    assert found.text[start:end].lower().startswith("хлоргексидин")
+    assert found.text[start:end].lower().startswith(MARKER)
 
 
 @pytest.mark.asyncio
 async def test_semantic_mode_without_embedder_yields_nothing(session_factory, document) -> None:
     """Деградация честная: пустая выдача, а не подмена лексическим поиском."""
-    page = await fragments(session_factory).search("хлоргексидином", "semantic", 0, 20)
+    page = await fragments(session_factory).search(MARKER, "semantic", 0, 20)
     assert page.total == 0
 
 
 @pytest.mark.asyncio
 async def test_rrf_mode_works_with_lexical_source_alone(session_factory, document) -> None:
-    page = await fragments(session_factory).search("хлоргексидином", "rrf", 0, 20)
+    page = await fragments(session_factory).search(MARKER, "rrf", 0, 20)
 
     ours = [f for f in page.items if f.reg_num.startswith(PREFIX)]
     assert len(ours) == 1
@@ -179,7 +184,7 @@ async def test_backfilled_offsets_reach_the_search_result(session_factory, docum
     """Сквозное свойство: найденный фрагмент можно показать в документе."""
     await backfill(session_factory, dry_run=False)
 
-    page = await fragments(session_factory).search("хлоргексидином", "lexical", 0, 20)
+    page = await fragments(session_factory).search(MARKER, "lexical", 0, 20)
     found = next(f for f in page.items if f.reg_num.startswith(PREFIX))
 
     async with session_factory() as session:
@@ -190,4 +195,4 @@ async def test_backfilled_offsets_reach_the_search_result(session_factory, docum
         )
 
     assert found.char_start is not None
-    assert content[found.char_start : found.char_end].endswith("хлоргексидином.")
+    assert content[found.char_start : found.char_end].endswith(f"{MARKER_FORM}.")

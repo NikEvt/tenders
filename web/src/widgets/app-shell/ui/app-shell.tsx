@@ -15,6 +15,7 @@ import { cn } from "@/shared/lib/cn";
 import { degradedStore, useDegraded } from "@/features/compile-filter/model/degraded-store";
 import { NAV } from "../model/nav";
 import { BottomBar, SideRail } from "./side-rail";
+import { RunningJobs } from "./running-jobs";
 import { ThemeToggle } from "./theme-toggle";
 
 // Командная строка и лист горячих клавиш открываются по требованию — держать
@@ -68,6 +69,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               переехала внутрь поля поиска (widgets/tender-list/ui/search-bar),
               сочетание клавиш не изменилось. */}
           <div className="ml-auto flex items-center gap-2">
+            {/* Идущие операции видны из любого раздела: запуск делается на
+                одной странице, а ждать приходится везде. */}
+            <RunningJobs />
             <Tooltip content={ru.keyboard.sheet} shortcut="?">
               <Button
                 variant="ghost"

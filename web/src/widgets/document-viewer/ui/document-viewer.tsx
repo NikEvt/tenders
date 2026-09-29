@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ChevronDown, ChevronUp, Download, ScanText } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, ExternalLink, ScanText } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/field";
 import { Mono } from "@/shared/ui/mono";
@@ -162,14 +162,23 @@ export function DocumentViewer({
             ) : null}
           </div>
 
+          {/*
+            Копий вложений система не хранит: она извлекает текст, а оригинал
+            остаётся в ЕИС. Поэтому ссылка внешняя и бессрочная — `expires_in`
+            равен нулю не потому, что истекла, а потому что сроком её жизни
+            распоряжаемся не мы. Слова про «временную ссылку» здесь были бы
+            неправдой, а иконка загрузки обещала бы файл с нашего сервера.
+          */}
           {download.data ? (
             <Button asChild variant="secondary" size="sm">
-              <a href={download.data.url} download>
-                <Download className="h-4 w-4" strokeWidth={1.5} aria-hidden="true" />
-                {ru.documents.downloadOriginal}
+              <a href={download.data.url} target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="h-4 w-4" strokeWidth={1.5} aria-hidden="true" />
+                {ru.documents.openInEis}
               </a>
             </Button>
-          ) : null}
+          ) : (
+            <p className="text-caption text-text-subtle">{ru.documents.noOriginal}</p>
+          )}
         </div>
       </div>
 

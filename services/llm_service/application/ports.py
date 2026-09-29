@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import date
+from datetime import date, datetime
 from typing import TypeVar
 
 from pydantic import BaseModel
@@ -89,10 +89,6 @@ class FilterRepositoryPort(ABC):
     async def delete_filter(self, filter_id: int) -> bool: ...
 
     @abstractmethod
-    async def mark_run(self, filter_id: int) -> None:
-        """Отмечает время последнего прогона."""
-
-    @abstractmethod
     async def cached_verdict_tender_ids(
         self, filter_id: int, prompt_version: str
     ) -> set[int]: ...
@@ -110,7 +106,13 @@ class FilterRepositoryPort(ABC):
 
 class DigestRepositoryPort(ABC):
     @abstractmethod
-    async def collect(self, digest_date: date) -> DigestInput: ...
+    async def collect(self, digest_date: date) -> DigestInput:
+        """Материал за день — по фильтрам, включённым в сводку.
+
+        Отбор идёт по тем же предикатам, что и каталог
+        (`libs/shared/db/tender_criteria.py`): второй реализации у правила
+        отбора быть не должно.
+        """
 
     @abstractmethod
     async def save(
@@ -124,14 +126,28 @@ class DigestRepositoryPort(ABC):
     ) -> None: ...
 
     @abstractmethod
-    async def exists(self, digest_date: date) -> bool: ...
+    async def built_at(self, digest_date: date) -> datetime | None:
+        """Когда сводка за этот день была собрана. `None` — её ещё нет.
+
+        Не `exists`: важен не факт наличия, а **когда** её собрали. Сводка,
+        собранная в середине того же дня, описывает половину дня, и считать её
+        готовой нельзя. Прежний `exists` этой разницы не знал, поэтому сводка
+        за 13 августа навсегда осталась с четырьмястами закупками из 4878.
+        """
 
 
 class JobTrackerPort(ABC):
     """Статус длительной операции, запущенной через API."""
 
     @abstractmethod
-    async def start(self, job_id: str, kind: str, total: int) -> None: ...
+    async def start(
+        self, job_id: str, kind: str, total: int, phase: str | None = None
+    ) -> None:
+        """Начинает задание или переводит его в следующую фазу.
+
+        Повторный вызов законен и обнуляет `processed`: у новой фазы свой
+        знаменатель, и продолжать счёт предыдущей значило бы врать шкалой.
+        """
 
     @abstractmethod
     async def progress(self, job_id: str, processed: int) -> None: ...

@@ -1,6 +1,8 @@
 import { api, unwrap } from "./client";
 import type {
   CompileResult,
+  CorpusOverview,
+  CorpusProcessing,
   Digest,
   DigestDates,
   Facets,
@@ -10,13 +12,17 @@ import type {
   DocumentPipeline,
   DocumentsStatus,
   Filter,
-  FilterSpec,
+  CriteriaSpec,
   FragmentPage,
   ProfileWins,
   Queues,
   RatingHistory,
   SearchMode,
   ServicesHealth,
+  LoadLevel,
+  Market,
+  ResearchRun,
+  ResearchTenders,
   Settings,
   TenderEvents,
   DocumentText,
@@ -47,6 +53,8 @@ export type TenderQuery = {
   documents_status?: DocumentsStatus;
   has_text?: boolean;
   filter_id?: number;
+  /** Вердикты сохранённого фильтра; не указано — только прошедшие. */
+  filter_verdict?: ("confirmed" | "rejected" | "disputed")[];
   page?: number;
   page_size?: number;
   /**
@@ -186,7 +194,7 @@ export const endpoints = {
    * `spec` передаётся, когда пользователь правил условия в конструкторе:
    * без него сервер скомпилировал бы текст заново и правки бы потерялись.
    */
-  saveFilter: (name: string, query: string, spec?: FilterSpec, signal?: Signal) =>
+  saveFilter: (name: string, query: string, spec?: CriteriaSpec, signal?: Signal) =>
     unwrap<SavedFilter>(
       "POST /filters",
       (init) =>
@@ -235,13 +243,52 @@ export const endpoints = {
       }),
     ),
 
-  runFilter: (filterId: number, body: { since?: string; tender_ids?: number[] }, signal?: Signal) =>
+  /**
+   * Запуск исследования по выбранному охвату.
+   *
+   * Регионы **перекрывают** структурные условия критерия, а не дополняют их:
+   * иначе воронка описывала бы не тот корпус, который просили.
+   */
+  runFilter: (
+    filterId: number,
+    body: { since?: string; until?: string; regions?: string[] },
+    signal?: Signal,
+  ) =>
     unwrap<JobAccepted>(
       `POST /filters/${filterId}/run`,
       (init) =>
         api.POST("/filters/{filter_id}/run", {
           params: { path: { filter_id: filterId } },
-          body: { since: body.since ?? null, tender_ids: body.tender_ids ?? [] },
+          body: {
+            since: body.since || null,
+            until: body.until || null,
+            regions: body.regions ?? [],
+          },
+          ...init,
+        }),
+      signal,
+    ),
+
+  /**
+   * Заказ выгрузки из ЕИС.
+   *
+   * ЕИС отдаёт суточные архивы, поэтому «обновить» — это перекачать архивы
+   * последних дней. Новыми окажутся лишь те извещения, которых ещё не было:
+   * дедупликация идёт по реестровому номеру.
+   */
+  requestCrawl: (
+    body: { since?: string; until?: string; regions?: string[] },
+    signal?: Signal,
+  ) =>
+    unwrap<JobAccepted>(
+      "POST /crawl",
+      (init) =>
+        api.POST("/crawl", {
+          body: {
+            since: body.since || null,
+            until: body.until || null,
+            regions: body.regions ?? [],
+          },
           ...init,
         }),
       signal,
@@ -365,6 +412,64 @@ export const endpoints = {
       signal,
     ),
 
+  /** Уровень нагрузки на машину: единственный настоящий переключатель настроек. */
+  loadLevel: (signal?: Signal) =>
+    unwrap<LoadLevel>(
+      "GET /system/load-level",
+      (init) => api.GET("/system/load-level", init),
+      signal,
+    ),
+
+  setLoadLevel: (level: 1 | 2 | 3) =>
+    unwrap<LoadLevel>("PATCH /system/load-level", (init) =>
+      api.PATCH("/system/load-level", { body: { level }, ...init }),
+    ),
+
+  /** Прогоны исследований. */
+  researchRuns: (limit = 50, signal?: Signal) =>
+    unwrap<ResearchRun[]>(
+      "GET /research/runs",
+      (init) => api.GET("/research/runs", { params: { query: { limit } }, ...init }),
+      signal,
+    ),
+
+  researchRun: (runId: number, signal?: Signal) =>
+    unwrap<ResearchRun>(
+      `GET /research/runs/${runId}`,
+      (init) =>
+        api.GET("/research/runs/{run_id}", {
+          params: { path: { run_id: runId } },
+          ...init,
+        }),
+      signal,
+    ),
+
+  researchTenders: (
+    runId: number,
+    params: { confidence?: string; page?: number; page_size?: number } = {},
+    signal?: Signal,
+  ) =>
+    unwrap<ResearchTenders>(
+      `GET /research/runs/${runId}/tenders`,
+      (init) =>
+        api.GET("/research/runs/{run_id}/tenders", {
+          params: { path: { run_id: runId }, query: params },
+          ...init,
+        }),
+      signal,
+    ),
+
+  researchMarket: (runId: number, signal?: Signal) =>
+    unwrap<Market>(
+      `GET /research/runs/${runId}/market`,
+      (init) =>
+        api.GET("/research/runs/{run_id}/market", {
+          params: { path: { run_id: runId } },
+          ...init,
+        }),
+      signal,
+    ),
+
   settings: (signal?: Signal) =>
     unwrap<Settings>("GET /settings", (init) => api.GET("/settings", init), signal),
 
@@ -409,6 +514,23 @@ export const endpoints = {
 
   profileWins: (signal?: Signal) =>
     unwrap<ProfileWins>("GET /profile/wins", (init) => api.GET("/profile/wins", init), signal),
+
+  /** Состав корпуса за период: по дням, регионам и ОКПД2. */
+  corpusOverview: (days: number, limit: number, signal?: Signal) =>
+    unwrap<CorpusOverview>(
+      "GET /data/overview",
+      (init) => api.GET("/data/overview", { params: { query: { days, limit } }, ...init }),
+      signal,
+    ),
+
+  /** Ход векторизации и сегодняшней выгрузки. Опрашивается часто — отсюда и
+      отдельный маршрут: состав корпуса считать каждые 15 секунд незачем. */
+  corpusProcessing: (signal?: Signal) =>
+    unwrap<CorpusProcessing>(
+      "GET /data/processing",
+      (init) => api.GET("/data/processing", init),
+      signal,
+    ),
 
   health: (signal?: Signal) =>
     unwrap<{ status: string }>("GET /health", (init) => api.GET("/health", init), signal),

@@ -31,8 +31,3 @@ export function useJob(jobId: string | null) {
 export function isJobRunning(job: Job | undefined): boolean {
   return Boolean(job && !TERMINAL.has(job.status));
 }
-
-export function jobProgress(job: Job | undefined): number | null {
-  if (!job || !job.total) return null;
-  return Math.min(1, (job.processed ?? 0) / job.total);
-}

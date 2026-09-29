@@ -1,7 +1,9 @@
 import {
   Activity,
   BookOpen,
+  Database,
   Filter,
+  FlaskConical,
   LayoutList,
   Newspaper,
   Search,
@@ -27,6 +29,8 @@ export const NAV: NavItem[] = [
   { href: "/tenders", label: ru.nav.tenders, icon: LayoutList, goKey: "c", primary: true },
   { href: "/search", label: ru.nav.search, icon: Search, primary: true },
   { href: "/filters", label: ru.nav.filters, icon: Filter, goKey: "f", primary: true },
+  { href: "/research", label: ru.nav.research, icon: FlaskConical, goKey: "i" },
+  { href: "/data", label: ru.nav.data, icon: Database, goKey: "n" },
   { href: "/recommendations", label: ru.nav.recommendations, icon: Sparkle, goKey: "r", primary: true },
   { href: "/profile", label: ru.nav.profile, icon: UserRound },
   { href: "/monitoring", label: ru.nav.monitoring, icon: Activity, goKey: "m" },

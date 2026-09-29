@@ -7,17 +7,53 @@ from datetime import date
 import httpx
 
 from libs.shared.logging import get_logger
-from services.api.application.ports import (
+from services.api.application.errors import (
+    ApplicationError,
+    Conflict,
+    DownstreamRejected,
     DownstreamUnavailable,
-    LlmServicePort,
-    RecsysServicePort,
+    InvalidRequest,
+    NotFound,
 )
+from services.api.application.ports import LlmServicePort, RecsysServicePort
 
 log = get_logger(__name__)
 
 # Компиляция фильтра и запуск задания идут через модель — секундами тут не обойтись.
 LLM_TIMEOUT = 240.0
 RECSYS_TIMEOUT = 30.0
+
+
+def _detail(response: httpx.Response) -> str:
+    """Текст отказа соседа. Своё сообщение он объясняет лучше, чем мы за него."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text.strip()[:500]
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if detail is not None:
+            return str(detail)[:500]
+    return response.text.strip()[:500]
+
+
+def _rejected(service: str, status: int, detail: str) -> ApplicationError:
+    """Отказ соседа → ошибка прикладного слоя.
+
+    Статус переводится в словарь приложения, а не пробрасывается числом:
+    прикладной слой про HTTP не знает, а клиенту важно различать «сущности
+    нет» и «сосед сломался». 404 от соседа означает ровно то же, что 404 от
+    нас, — сосед при этом отработал правильно, и 502 был бы напраслиной.
+    """
+    if status == 404:
+        return NotFound(detail or f"{service}: не найдено")
+    if status in (400, 422):
+        return InvalidRequest(detail or f"{service}: запрос отвергнут")
+    if status == 409:
+        return Conflict(detail or f"{service}: конфликт состояния")
+    return DownstreamRejected(detail or f"{service} вернул {status}", status=status)
 
 
 class _BaseClient:
@@ -34,13 +70,16 @@ class _BaseClient:
             response = await self._client.request(method, f"{self._base_url}{path}", **kwargs)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            # 4xx — это ответ сервиса, а не его недоступность: пробрасываем как есть.
-            if exc.response.status_code < 500:
-                raise
-            log.warning(
-                "downstream.error", service=self._name, status=exc.response.status_code
-            )
-            raise DownstreamUnavailable(f"{self._name} вернул {exc.response.status_code}") from exc
+            status = exc.response.status_code
+            if status < 500:
+                # 4xx — это ответ соседа, а не его недоступность. Раньше здесь
+                # стоял голый `raise`, и `httpx.HTTPStatusError` уходил мимо
+                # обработчиков: запрос несуществующего фильтра превращался во
+                # «внутреннюю ошибку сервиса», где клиент не мог отличить
+                # «такого нет» от «шлюз сломался».
+                raise _rejected(self._name, status, _detail(exc.response)) from exc
+            log.warning("downstream.error", service=self._name, status=status)
+            raise DownstreamUnavailable(f"{self._name} вернул {status}") from exc
         except httpx.HTTPError as exc:
             log.warning("downstream.unreachable", service=self._name, error=str(exc))
             raise DownstreamUnavailable(f"{self._name} недоступен: {exc}") from exc
@@ -78,14 +117,19 @@ class HttpLlmService(_BaseClient, LlmServicePort):
         )
 
     async def run_filter(
-        self, filter_id: int, since: date | None, tender_ids: list[int]
+        self,
+        filter_id: int,
+        since: date | None,
+        until: date | None,
+        regions: list[str],
     ) -> dict:
         return await self._request(  # type: ignore[return-value]
             "POST",
             f"/filters/{filter_id}/run",
             json={
                 "since": since.isoformat() if since else None,
-                "tender_ids": tender_ids,
+                "until": until.isoformat() if until else None,
+                "regions": regions,
             },
         )
 

@@ -1,9 +1,15 @@
-"""Use-case выгрузки тендеров: источник → репозиторий → события."""
+"""Use-case выгрузки тендеров: источник → репозиторий → события.
+
+Здесь одна выгрузка — регион × тип × день. Набором таких выгрузок владеет
+`CrawlPeriodUseCase`: он один знает, что уже выгружено, и в каком порядке
+обходить. Второй сценарий на ту же ответственность здесь когда-то был
+(`CrawlAllUseCase`) — последовательный, в одной транзакции на все регионы, — и
+на восьмидесяти пяти субъектах это стало неприемлемо.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
 
 from libs.shared.contracts.events import TenderIngested
 from libs.shared.contracts.ports import EventPublisher
@@ -89,35 +95,3 @@ class CrawlTendersUseCase:
             await self._run_log.finish(run_id, result)
 
         return result
-
-
-class CrawlAllUseCase:
-    """Обход всех сконфигурированных комбинаций регион × тип документа."""
-
-    def __init__(
-        self,
-        crawl: CrawlTendersUseCase,
-        regions: list[str],
-        document_types: list[str],
-    ) -> None:
-        self._crawl = crawl
-        self._regions = regions
-        self._document_types = document_types
-
-    async def execute(self, target_date: date | None = None) -> list[CrawlResult]:
-        # ЕИС отдаёт выгрузку за завершившийся день, поэтому по умолчанию — вчера.
-        day = target_date or (date.today() - timedelta(days=1))
-
-        results: list[CrawlResult] = []
-        for region in self._regions:
-            for document_type in self._document_types:
-                results.append(
-                    await self._crawl.execute(
-                        CrawlRequest(
-                            region=region,
-                            document_type=document_type,
-                            target_date=day,
-                        )
-                    )
-                )
-        return results

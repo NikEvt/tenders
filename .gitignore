@@ -20,6 +20,9 @@ build/
 data/*.xml
 data/*.zip
 data/documents_list.txt
+# Выгрузки прогонов: sqlite на сотни мегабайт, GitHub такие не принимает
+data/market_analysis/
+data/eval/
 models/
 *.log
 
@@ -35,3 +38,7 @@ AutoWorkInstaller-*.bin
 legacy/
 .import_linter_cache/
 node_modules
+
+# Артефакты сборки web
+web/.next/
+*.tsbuildinfo

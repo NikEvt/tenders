@@ -108,6 +108,41 @@ class TestBrokenPatternsAreDropped:
         assert [term.name for term in cleaned.terms] == ["хороший"]
         assert cleaned.is_usable
 
+    def test_a_degenerate_pattern_is_removed_too(self) -> None:
+        """Шаблон, выродившийся в повтор, компилируется — и потому опаснее битого.
+
+        Структурный вывод держит форму JSON, но не длину строки внутри него.
+        Модель зациклилась в значении `pattern`: `газ(?!овый|…|опроводник|
+        опроводник|…` на шестнадцать тысяч символов. Такой критерий сохранился
+        бы, прогон отработал бы, находок не было бы — и причину никто бы
+        не нашёл.
+        """
+        runaway = "газ(?!" + "опроводник|" * 500 + "конец)"
+        spec = CriteriaSpec(
+            name="x",
+            terms=[
+                TermSpec(name="хороший", pattern=r"ХПК"),
+                TermSpec(name="выродившийся", pattern=runaway),
+            ],
+        )
+
+        # Он именно компилируется — первой проверки ему мало.
+        import re as _re
+
+        assert _re.compile(runaway)
+
+        cleaned = _drop_broken_patterns(spec)
+
+        assert [term.name for term in cleaned.terms] == ["хороший"]
+        assert cleaned.is_usable
+
+    def test_a_long_but_sane_pattern_survives(self) -> None:
+        """Потолок не должен резать честные шаблоны: самый длинный в наборе — 118 символов."""
+        sane = r"(?:ХПК|BOD|БПК)\s*[0-9]{0,2}\s*(?:мг|mg)/(?:дм3|л|l)" * 3
+        spec = CriteriaSpec(name="x", terms=[TermSpec(name="длинный", pattern=sane)])
+
+        assert len(_drop_broken_patterns(spec).terms) == 1
+
     def test_broken_rule_is_removed_but_terms_stay(self) -> None:
         spec = CriteriaSpec(
             name="x",

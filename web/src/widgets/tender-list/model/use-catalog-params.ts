@@ -41,6 +41,12 @@ export const catalogParsers = {
   has_text: parseAsBoolean.withDefault(false),
   filter_id: parseAsInteger,
   /**
+   * Какие вердикты сохранённого фильтра показывать. Умолчание — прошедшие:
+   * так выдача по фильтру означает «фильтр это отобрал», а не «фильтр это
+   * видел». Остальные значения дают проверить фильтр по тому, что он отсёк.
+   */
+  filter_verdict: parseAsString.withDefault("confirmed"),
+  /**
    * Сортировка и группировка живут в адресе как есть, строками: разбирает их
    * реестр (`entities/tender/model/sort.ts`), а не парсер nuqs. Иначе
    * добавление поля пришлось бы дублировать в двух местах, а устаревшая
@@ -102,7 +108,13 @@ export function toTenderQuery(params: CatalogParams): TenderQuery & { q?: string
   if (params.only_active) query.only_active = true;
   if (params.deadline_changed) query.deadline_changed = true;
   if (params.has_text) query.has_text = true;
-  if (params.filter_id !== null) query.filter_id = params.filter_id;
+  if (params.filter_id !== null) {
+    query.filter_id = params.filter_id;
+    // Умолчание сервер знает сам — гонять его в адресе незачем.
+    if (params.filter_verdict === "rejected" || params.filter_verdict === "disputed") {
+      query.filter_verdict = [params.filter_verdict];
+    }
+  }
 
   return query;
 }

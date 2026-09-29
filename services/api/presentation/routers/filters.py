@@ -14,6 +14,7 @@ from services.api.presentation.deps import GetFilter, GetJob, ListFilters, LlmDe
 from services.api.presentation.schemas import (
     CompileFilterIn,
     FilterOut,
+    JobOut,
     PatchFilterIn,
     RunFilterIn,
     SaveFilterIn,
@@ -62,8 +63,13 @@ async def duplicate_filter(filter_id: int, llm: LlmDep) -> dict:
 
 @router.post("/filters/{filter_id}/run", status_code=202)
 async def run_filter(filter_id: int, request: RunFilterIn, llm: LlmDep) -> dict:
-    """Запуск LLM-фильтрации. Прогон занимает минуты — отвечаем job_id."""
-    return await llm.run_filter(filter_id, request.since, request.tender_ids)
+    """Запуск исследования по выбранному охвату. Прогон идёт минутами — отвечаем job_id.
+
+    Ход прогона виден в `GET /jobs/{job_id}`, результат — в `GET /research/runs/{run_id}`.
+    """
+    return await llm.run_filter(
+        filter_id, request.since, request.until, request.regions
+    )
 
 
 @router.post("/filters/{filter_id}/test", status_code=202)
@@ -75,6 +81,12 @@ async def test_filter(filter_id: int, request: TestFilterIn, llm: LlmDep) -> dic
     return await llm.test_filter(filter_id, request.days)
 
 
-@router.get("/jobs/{job_id}")
-async def job_status(job_id: str, use_case: GetJob) -> dict:
-    return await use_case.execute(job_id)
+@router.get("/jobs/{job_id}", response_model=JobOut)
+async def job_status(job_id: str, use_case: GetJob) -> JobOut:
+    """Ход длительной операции: фаза, счётчик внутри неё и время старта.
+
+    Схема объявлена, а не выведена из `dict`: по этому ответу рисуется шкала
+    ожидания, и клиент обязан получать её тип из `openapi.json`, а не
+    переписывать руками.
+    """
+    return JobOut.of(await use_case.execute(job_id))

@@ -37,7 +37,7 @@ QUEUE = QueueSpec(
     prefetch=1,
 )
 
-DEFAULT_LLM_SERVICE_URL = "http://llm-service:8030"
+DEFAULT_LLM_SERVICE_URL = "http://llm-service:8010"
 
 
 async def run() -> None:
@@ -110,6 +110,61 @@ async def execute(container: ResearchContainer, event: ResearchRequested) -> Non
         event.until,
     )
 
+    try:
+        await _run(container, event, criteria, run_id, job_id, budget)
+    except Exception as exc:
+        # Обещание докстринга держится здесь. Раньше обёрнут был только разбор
+        # критерия, и падение в обходе корпуса или в судье оставляло и задание,
+        # и прогон в `running` навсегда.
+        log.exception("research.run_failed", run_id=run_id)
+        await container.runs.fail(run_id, str(exc))
+        await container.jobs.fail(job_id, str(exc))
+        # Наверх — чтобы повторы и dead-letter работали как прежде.
+        raise
+
+
+#: Названия фаз прогона. Живут в `presentation`, потому что это подписи на
+#: экране, а не понятия предметной области: `application` знает только числа.
+PHASE_SCAN = "обход корпуса"
+PHASE_JUDGE = "судья читает документы"
+
+
+class _JobProgress:
+    """Ход одной фазы → строка задания.
+
+    Адаптер живёт здесь, в `presentation`: порт знает только про числа, а про
+    таблицу заданий — инфраструктура.
+
+    **Экземпляр на фазу.** Фаза — свойство адаптера, а не аргумент отчёта:
+    иначе о ней пришлось бы знать порту, то есть слою, который сознательно не
+    знает, куда идут числа.
+    """
+
+    def __init__(self, container: ResearchContainer, job_id: str, phase: str) -> None:
+        self._container = container
+        self._job_id = job_id
+        self._phase = phase
+        self._total: int | None = None
+
+    async def report(self, processed: int, total: int) -> None:
+        if total != self._total:
+            # Общее число известно только после подсчёта корпуса. `start` —
+            # вставка с обновлением, поэтому повторный вызов законен; он же
+            # переводит задание в эту фазу и обнуляет счётчик предыдущей.
+            self._total = total
+            await self._container.jobs.start(self._job_id, "research", total, self._phase)
+        await self._container.jobs.progress(self._job_id, processed)
+
+
+async def _run(
+    container: ResearchContainer,
+    event: ResearchRequested,
+    criteria,
+    run_id: int,
+    job_id: str,
+    budget: LoadBudget,
+) -> None:
+    """Обход корпуса и разбор находок — то, что может упасть на середине."""
     # Корпус сужается структурными условиями критерия ещё до чтения текстов.
     corpus = SqlCorpusRepository(container.session_factory, criteria.structural)
 
@@ -120,6 +175,7 @@ async def execute(container: ResearchContainer, event: ResearchRequested) -> Non
         hits=container.hits,
         runs=container.runs,
         readers=budget.extraction_workers,
+        progress=_JobProgress(container, job_id, PHASE_SCAN),
     )
     stats = await scan.execute(
         run_id=run_id,
@@ -131,10 +187,23 @@ async def execute(container: ResearchContainer, event: ResearchRequested) -> Non
     judge = JudgeDisputedUseCase(
         criteria,
         container.judge,
-        cache=container.verdicts,
+        store=container.verdicts,
         concurrency=budget.llm_concurrency,
+        # Пробный прогон считает воронку, но не оставляет вердиктов: отбор по
+        # сохранённому фильтру ключуется версией критерия, а не прогоном, и
+        # решения теста были бы неотличимы от настоящих.
+        dry_run=event.dry_run,
+        # Вторая фаза, и она же самая долгая. Пока её не было на шкале, полоса
+        # доходила до конца обхода и стояла там минуты — то есть утверждала,
+        # что прогон закончен, посреди работы судьи.
+        progress=_JobProgress(container, job_id, PHASE_JUDGE),
     )
     outcome = await judge.execute(stats.candidates)
+
+    if not event.dry_run:
+        # Отметка о настоящем прогоне: по ней меню фильтров отличает критерий
+        # с вердиктами от того, что даст пустую выдачу.
+        await container.criteria.mark_run(event.filter_id)
 
     confirmed = sum(1 for v in outcome.verdicts if v.confidence.value == "confirmed")
     rejected = sum(1 for v in outcome.verdicts if v.confidence.value == "rejected")

@@ -28,7 +28,7 @@ from services.research.infrastructure.repositories import (
     SqlCriteriaRepository,
     SqlHitRepository,
     SqlResearchRunRepository,
-    SqlVerdictCache,
+    SqlVerdictStore,
 )
 from services.research.infrastructure.storage import MinioTextStorage
 
@@ -44,7 +44,7 @@ class ResearchContainer:
     criteria: SqlCriteriaRepository
     hits: SqlHitRepository
     runs: SqlResearchRunRepository
-    verdicts: SqlVerdictCache
+    verdicts: SqlVerdictStore
     jobs: SqlJobTracker
     texts: TextStoragePort
     judge: HttpModelJudge
@@ -76,7 +76,7 @@ async def build_container(
         criteria=SqlCriteriaRepository(session_factory),
         hits=SqlHitRepository(session_factory),
         runs=SqlResearchRunRepository(session_factory),
-        verdicts=SqlVerdictCache(session_factory),
+        verdicts=SqlVerdictStore(session_factory),
         jobs=SqlJobTracker(session_factory),
         texts=MinioTextStorage(minio),
         # Своего клиента к модели у движка нет: ключи и структурный вывод —

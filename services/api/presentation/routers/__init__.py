@@ -10,12 +10,15 @@ from fastapi import APIRouter
 
 from services.api.presentation.routers import (
     catalog,
+    crawl,
+    data,
     digest,
     documents,
     filters,
     load,
     monitoring,
     recommendations,
+    research,
     search,
     settings,
     system,
@@ -23,12 +26,15 @@ from services.api.presentation.routers import (
 
 ROUTERS: tuple[APIRouter, ...] = (
     catalog.router,
+    crawl.router,
     documents.router,
     filters.router,
     search.router,
     digest.router,
     recommendations.router,
+    research.router,
     monitoring.router,
+    data.router,
     settings.router,
     load.router,
     system.router,

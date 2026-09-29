@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from libs.shared.load_policy import (
+    MAX_CRAWL_WORKERS,
     LoadLevel,
     detect_cpu_count,
     resolve,
@@ -170,3 +171,34 @@ class TestDetection:
     def test_explicit_argument_wins_over_the_environment(self, monkeypatch) -> None:
         monkeypatch.setenv("LOAD_LEVEL", "1")
         assert resolve_current(3).level == LoadLevel.FULL
+
+
+class TestCrawlMemoryCeiling:
+    """Выгрузка ограничена памятью так же, как разбор документов.
+
+    Суточный архив региона распаковывается в память целиком. Замер 14 августа
+    2026: три одновременных обхода — пик 633 МиБ, и краулер с лимитом 256 МиБ
+    дважды перезапустился на середине страны. До этого потолка по памяти у
+    выгрузки не было вовсе.
+    """
+
+    def test_a_tight_limit_collapses_to_one(self) -> None:
+        budget = resolve(LoadLevel.FULL, cpu_count=8, memory_mb=256)
+        assert budget.crawl_workers == 1
+
+    def test_a_roomy_limit_keeps_the_level(self) -> None:
+        budget = resolve(LoadLevel.FULL, cpu_count=8, memory_mb=4096)
+        assert budget.crawl_workers == MAX_CRAWL_WORKERS
+
+    def test_memory_never_raises_above_the_level(self) -> None:
+        """Потолок памяти сужает, но не расширяет: фоновый уровень остаётся одним."""
+        budget = resolve(LoadLevel.BACKGROUND, cpu_count=32, memory_mb=8192)
+        assert budget.crawl_workers == 1
+
+    def test_measured_peak_admits_three_at_the_balanced_level(self) -> None:
+        budget = resolve(LoadLevel.BALANCED, cpu_count=8, memory_mb=768)
+        assert budget.crawl_workers == 3
+
+    def test_outside_a_container_the_ceiling_does_not_apply(self) -> None:
+        budget = resolve(LoadLevel.FULL, cpu_count=8, memory_mb=None)
+        assert budget.crawl_workers == MAX_CRAWL_WORKERS

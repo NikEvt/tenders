@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -19,6 +19,8 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from libs.shared import load_policy
+from libs.shared.load_policy import detect_cpu_count
 from services.api.application.ports import DownstreamUnavailable
 from services.api.domain.catalog import (
     FacetBucket,
@@ -26,6 +28,14 @@ from services.api.domain.catalog import (
     PriceBucket,
     RestrictiveHint,
     SimilarTender,
+)
+from services.api.domain.corpus import (
+    CorpusOverview,
+    DayBucket,
+    Distribution,
+    EmbeddingProgress,
+    Slice,
+    TodayIngest,
 )
 from services.api.domain.documents import (
     ChunkOutline,
@@ -35,6 +45,7 @@ from services.api.domain.documents import (
     TextLocation,
 )
 from services.api.domain.filters import MatchCount, SavedFilterCard
+from services.api.domain.jobs import JobView
 from services.api.domain.models import (
     Page,
     TenderDetail,
@@ -54,6 +65,14 @@ from services.api.domain.monitoring import (
 )
 from services.api.domain.pagination import PageRequest
 from services.api.domain.profile import RatingRecord, WinRecord, WinsSummary
+from services.api.domain.research import (
+    MarketBucket,
+    MarketView,
+    ResearchFunnel,
+    ResearchHitView,
+    ResearchRunCard,
+    ResearchTenderRow,
+)
 from services.api.domain.settings import (
     CertificateInfo,
     CrawlerSettingsView,
@@ -69,6 +88,7 @@ DOCUMENT_ID = 42
 MISSING_DOCUMENT_ID = 999
 JOB_ID = "6f1b1e9c-0000-4000-8000-000000000000"
 DIGEST_DATE = "2026-08-07"
+RESEARCH_RUN_ID = 7
 MISSING_DIGEST_DATE = "2000-01-01"
 
 
@@ -96,7 +116,11 @@ def _summary() -> TenderSummary:
 
 
 class FakeCatalog:
+    def __init__(self) -> None:
+        self.seen: Any | None = None
+
     async def list(self, filters: Any, page: PageRequest) -> Page:
+        self.seen = filters
         return Page(
             items=[_summary()],
             total=1,
@@ -134,10 +158,14 @@ class FakeSearch:
     #: Что вернёт `matching_ids` — им должны ограничиться фасеты.
     IDS: ClassVar[list[int]] = [11, 22, 33]
 
+    def __init__(self) -> None:
+        self.seen: Any | None = None
+
     async def matching_ids(self, query: str, filters: Any) -> list[int]:
         return list(self.IDS)
 
     async def search(self, query: str, filters: Any, page: PageRequest) -> Page:
+        self.seen = filters
         summary = _summary()
         summary.relevance = 0.5
         return Page(items=[summary], total=1, page=page.page, page_size=page.limit)
@@ -215,19 +243,27 @@ class FakeDigests:
 
 
 class FakeJobs:
-    async def get(self, job_id: str) -> dict | None:
+    """Задание в середине второй фазы: обход корпуса позади, судья работает."""
+
+    def __init__(self, total: int | None = 10, phase: str | None = "судья читает документы"):
+        self.total = total
+        self.phase = phase
+
+    async def get(self, job_id: str) -> JobView | None:
         if job_id != JOB_ID:
             return None
-        return {
-            "job_id": JOB_ID,
-            "kind": "filter_evaluate",
-            "status": "done",
-            "total": 10,
-            "processed": 10,
-            "result": {"matched": [1]},
-            "error": None,
-            "updated_at": "2026-08-08T07:00:00+00:00",
-        }
+        return JobView(
+            job_id=JOB_ID,
+            kind="research",
+            status="running",
+            phase=self.phase,
+            total=self.total,
+            processed=4,
+            result=None,
+            error=None,
+            created_at=datetime(2026, 8, 8, 7, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 8, 7, 1, tzinfo=UTC),
+        )
 
 
 class FakeFragments:
@@ -350,7 +386,57 @@ class FakePipeline:
             ocr=12,
             chunked=78,
             embedded=70,
-            failures=[("failed", 15)],
+            failures=[("failed", 15), ("deferred", 40)],
+            skip_reasons=[("tender_budget", 30), ("multivolume", 10)],
+        )
+
+
+class FakeCorpus:
+    """Корпус из двух дней: один выгружен, второй — дыра в покрытии."""
+
+    async def overview(self, since, until, limit) -> CorpusOverview:
+        return CorpusOverview(
+            since=since,
+            until=until,
+            total=30,
+            total_all_time=900,
+            earliest=date(2026, 1, 1),
+            latest=until,
+            by_day=[
+                DayBucket(day=since, count=0, crawled=False),
+                DayBucket(day=until, count=30, crawled=True),
+            ],
+            by_region=Distribution(
+                top=[Slice(key="77", label="Москва", count=18)],
+                others=7,
+                total=30,
+                unknown=5,
+            ),
+            by_okpd2=Distribution(
+                top=[Slice(key="26.20.11", label="Компьютеры", count=12)],
+                others=10,
+                total=30,
+                unknown=8,
+            ),
+        )
+
+    async def embeddings(self) -> EmbeddingProgress:
+        return EmbeddingProgress(
+            chunks_total=2000,
+            chunks_embedded=500,
+            tenders_total=900,
+            tenders_embedded=300,
+        )
+
+    async def today(self, day) -> TodayIngest:
+        return TodayIngest(
+            day=day,
+            runs_succeeded=42,
+            runs_failed=1,
+            runs_running=2,
+            saved=310,
+            published_today=298,
+            last_run_at=datetime(2026, 8, 15, 9, 30),
         )
 
 
@@ -482,11 +568,33 @@ class FakeLlm:
     async def test_filter(self, filter_id: int, days: int) -> dict:
         return {"job_id": JOB_ID, "days": days}
 
-    async def run_filter(self, filter_id: int, since: date | None, tender_ids: list[int]) -> dict:
+    async def run_filter(
+        self,
+        filter_id: int,
+        since: date | None,
+        until: date | None,
+        regions: list[str],
+    ) -> dict:
+        self.run_seen = {"since": since, "until": until, "regions": regions}
         return {"job_id": JOB_ID}
 
     async def request_digest(self, digest_date: date, force: bool) -> dict:
         return {"job_id": JOB_ID}
+
+
+class FakeCrawl:
+    def __init__(self) -> None:
+        self.requested: list[dict] = []
+
+    async def request(self, job_id, regions, date_from, date_to) -> None:
+        self.requested.append(
+            {
+                "job_id": str(job_id),
+                "regions": list(regions),
+                "since": date_from,
+                "until": date_to,
+            }
+        )
 
 
 class FakeRecsys:
@@ -526,9 +634,104 @@ class FakeRecsys:
         return None
 
 
+class FakeResearch:
+    """Отдаёт **доменные** объекты, а не SimpleNamespace.
+
+    Разница не косметическая: доменные модели объявлены со `slots=True`, у них
+    нет `__dict__`, и перенос полей через `vars()` на них падает. Заглушка с
+    `__dict__` этого бы не показала — маршрут `/research/runs/{id}/tenders`
+    отдавал 500 на живой базе, пока все тесты были зелёными.
+    """
+
+    async def runs(self, limit: int) -> list[ResearchRunCard]:
+        return [self._card()]
+
+    async def run(self, run_id: int) -> ResearchRunCard | None:
+        return self._card() if run_id == RESEARCH_RUN_ID else None
+
+    async def tenders(
+        self, run_id: int, confidence: str | None, limit: int, offset: int
+    ) -> tuple[list[ResearchTenderRow], int]:
+        if run_id != RESEARCH_RUN_ID:
+            return [], 0
+        return [self._row()], 1
+
+    async def market(self, run_id: int) -> MarketView:
+        if run_id != RESEARCH_RUN_ID:
+            return MarketView()
+        return MarketView(
+            total_count=2,
+            priced_count=2,
+            total_value=Decimal("900000.00"),
+            median_price=Decimal("450000.00"),
+            average_price=Decimal("450000.00"),
+            top_share=0.55,
+            by_region=[
+                MarketBucket(
+                    key="50",
+                    label="Московская область",
+                    count=2,
+                    total=Decimal("900000.00"),
+                    average=Decimal("450000.00"),
+                )
+            ],
+        )
+
+    @staticmethod
+    def _card() -> ResearchRunCard:
+        return ResearchRunCard(
+            run_id=RESEARCH_RUN_ID,
+            name="ХПК и БПК, август",
+            criteria_version="hpk-v3",
+            status="done",
+            regions=["50"],
+            funnel=ResearchFunnel(
+                tenders_total=600,
+                tenders_candidate=76,
+                documents_scanned=300,
+                documents_pending=12,
+                hits_found=333,
+                confirmed_by_rules=56,
+                rejected_by_rules=20,
+                disputed=8,
+            ),
+            confirmed=56,
+            rejected=20,
+        )
+
+    @staticmethod
+    def _row() -> ResearchTenderRow:
+        return ResearchTenderRow(
+            tender_id=1,
+            reg_num=REG_NUM,
+            name="Поставка мебели",
+            price=Decimal("450000.00"),
+            region_code="50",
+            customer_name="Администрация",
+            customer_inn="5000000001",
+            okpd2_code="31.01.11",
+            confidence="confirmed",
+            reason="прямое указание в ТЗ",
+            decided_by="rules",
+            score=0.91,
+            hits=[
+                ResearchHitView(
+                    term="хлоргексидин",
+                    role="confirm",
+                    quote="Мебель должна выдерживать обработку хлоргексидином.",
+                    match_start=36,
+                    match_end=50,
+                    file_name="ТЗ.pdf",
+                    page=2,
+                )
+            ],
+        )
+
+
 @pytest.fixture
 def container() -> SimpleNamespace:
     return SimpleNamespace(
+        research=FakeResearch(),
         catalog=FakeCatalog(),
         search=FakeSearch(),
         facets=FakeFacets(),
@@ -542,12 +745,14 @@ def container() -> SimpleNamespace:
         queues=FakeQueues(),
         crawler_runs=FakeCrawlerRuns(),
         pipeline=FakePipeline(),
+        corpus=FakeCorpus(),
         events=FakeEvents(),
         app_state=FakeAppState(),
         runtime_settings=FakeRuntimeSettings(),
         profile_history=FakeProfileHistory(),
         readiness=FakeReadiness(),
         storage=FakeStorage(),
+        crawl=FakeCrawl(),
         llm=FakeLlm(),
         recsys=FakeRecsys(),
     )
@@ -593,6 +798,39 @@ async def test_search_requires_query_of_two_characters(client) -> None:
     response = await client.get("/tenders/search", params={"q": "мебель"})
     assert response.status_code == 200
     assert response.json()["items"][0]["relevance"] is not None
+
+
+@pytest.mark.asyncio
+async def test_search_carries_the_saved_filter(client, container) -> None:
+    """Раньше роут подставлял `filter_id=None`, и фильтр молча переставал действовать."""
+    response = await client.get(
+        "/tenders/search", params={"q": "мебель", "filter_id": 7}
+    )
+
+    assert response.status_code == 200
+    assert container.search.seen.filter_id == 7
+
+
+@pytest.mark.asyncio
+async def test_catalog_defaults_to_matched_only(client, container) -> None:
+    await client.get("/tenders", params={"filter_id": 7})
+    assert container.catalog.seen.filter_verdicts == ("confirmed",)
+
+
+@pytest.mark.asyncio
+async def test_catalog_can_ask_for_rejected(client, container) -> None:
+    await client.get(
+        "/tenders", params={"filter_id": 7, "filter_verdict": ["rejected", "disputed"]}
+    )
+    assert container.catalog.seen.filter_verdicts == ("rejected", "disputed")
+
+
+@pytest.mark.asyncio
+async def test_unknown_verdict_is_refused(client) -> None:
+    response = await client.get(
+        "/tenders", params={"filter_id": 7, "filter_verdict": "почти"}
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -654,9 +892,25 @@ async def test_save_and_run_filter(client) -> None:
     assert saved.status_code == 201
     assert saved.json()["filter_id"] == 1
 
-    run = await client.post("/filters/1/run", json={"since": None, "tender_ids": []})
+    run = await client.post("/filters/1/run", json={"since": None})
     assert run.status_code == 202
     assert run.json()["job_id"] == JOB_ID
+
+
+@pytest.mark.asyncio
+async def test_run_carries_regions_and_period(client, container) -> None:
+    """Охват выбирают в форме — он обязан доехать до движка целиком."""
+    response = await client.post(
+        "/filters/1/run",
+        json={"since": "2026-07-01", "until": "2026-07-31", "regions": ["77", "78"]},
+    )
+
+    assert response.status_code == 202
+    assert container.llm.run_seen == {
+        "since": date(2026, 7, 1),
+        "until": date(2026, 7, 31),
+        "regions": ["77", "78"],
+    }
 
 
 @pytest.mark.asyncio
@@ -676,9 +930,37 @@ async def test_downstream_failure_becomes_503(client, container) -> None:
 async def test_job_status(client) -> None:
     response = await client.get(f"/jobs/{JOB_ID}")
     assert response.status_code == 200
-    assert response.json()["status"] == "done"
+    assert response.json()["status"] == "running"
 
     assert (await client.get("/jobs/нет-такого")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_job_names_its_phase_and_start(client) -> None:
+    """По этому ответу рисуется шкала: нужны фаза, счётчик и время старта.
+
+    Фаза — потому что операция состоит из этапов с разной ценой единицы работы;
+    время старта — потому что без него «идёт столько-то» и оценка остатка
+    считаются не из чего.
+    """
+    body = (await client.get(f"/jobs/{JOB_ID}")).json()
+
+    assert body["phase"] == "судья читает документы"
+    assert body["total"] == 10
+    assert body["processed"] == 4
+    assert body["created_at"].startswith("2026-08-08T07:00")
+
+
+@pytest.mark.asyncio
+async def test_job_is_typed_in_the_schema(client) -> None:
+    """Клиент обязан брать тип задания из схемы, а не переписывать руками."""
+    schema = (await client.get("/openapi.json")).json()
+    job = schema["paths"]["/jobs/{job_id}"]["get"]["responses"]["200"]
+    ref = job["content"]["application/json"]["schema"]["$ref"]
+
+    assert ref.endswith("/JobOut")
+    properties = schema["components"]["schemas"]["JobOut"]["properties"]
+    assert {"phase", "total", "processed", "created_at"} <= set(properties)
 
 
 # ─── Сводка ───────────────────────────────────────────────────────────────────
@@ -775,6 +1057,133 @@ async def test_unexpected_exception_becomes_500_not_a_crash(client, container) -
 
 
 @pytest.mark.asyncio
+async def test_crawl_defaults_to_yesterday_and_today(client, container) -> None:
+    """ЕИС публикует с задержкой: вчерашний архив к утру ещё дописывается."""
+    response = await client.post("/crawl", json={})
+
+    assert response.status_code == 202
+    assert response.json()["job_id"]
+    asked = container.crawl.requested[0]
+    assert asked["until"] == date.today()
+    assert asked["since"] == date.today() - timedelta(days=1)
+    assert asked["regions"] == []
+
+
+@pytest.mark.asyncio
+async def test_crawl_carries_the_chosen_scope(client, container) -> None:
+    response = await client.post(
+        "/crawl",
+        json={"since": "2026-07-01", "until": "2026-07-05", "regions": ["77", "078"]},
+    )
+
+    assert response.status_code == 202
+    asked = container.crawl.requested[0]
+    assert asked["since"] == date(2026, 7, 1)
+    assert asked["until"] == date(2026, 7, 5)
+    # Код приводится к двузначному виду: ЕИС шлёт то `77`, то `077`.
+    assert asked["regions"] == ["77", "78"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_refuses_a_reversed_period(client, container) -> None:
+    response = await client.post(
+        "/crawl", json={"since": "2026-07-05", "until": "2026-07-01"}
+    )
+
+    assert response.status_code == 422
+    assert container.crawl.requested == []
+
+
+@pytest.mark.asyncio
+async def test_crawl_refuses_a_year(client, container) -> None:
+    """Заявка на год из интерфейса — способ случайно устроить себе бан."""
+    response = await client.post(
+        "/crawl", json={"since": "2026-01-01", "until": "2026-12-31"}
+    )
+
+    assert response.status_code == 422
+    assert container.crawl.requested == []
+
+
+@pytest.mark.asyncio
+async def test_crawl_refuses_an_unknown_region(client, container) -> None:
+    """Опечатка в коде дала бы выгрузку, которая молча ничего не привезёт."""
+    response = await client.post("/crawl", json={"regions": ["77", "99"]})
+
+    assert response.status_code == 422
+    assert "99" in response.json()["detail"]
+    assert container.crawl.requested == []
+
+
+# ─── Вкладка «Данные» ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_data_overview_carries_its_denominators(client) -> None:
+    """Разрез без хвоста и итога читается как весь корпус."""
+    body = (await client.get("/data/overview")).json()
+
+    for section in ("by_region", "by_okpd2"):
+        cut = body[section]
+        shown = sum(item["count"] for item in cut["top"])
+        assert shown + cut["others"] + cut["unknown"] == cut["total"]
+
+    # Сколько корпуса вообще видно на экране — отдельным числом.
+    assert body["total_all_time"] >= body["total"]
+
+
+@pytest.mark.asyncio
+async def test_data_overview_marks_days_without_a_crawl(client) -> None:
+    """День без выгрузки обязан быть отличим от дня без закупок."""
+    body = (await client.get("/data/overview")).json()
+
+    assert {day["crawled"] for day in body["by_day"]} == {True, False}
+
+
+@pytest.mark.asyncio
+async def test_data_overview_rejects_an_impossible_window(client) -> None:
+    """Недопустимый период — 422 с сообщением, а не молчаливое приведение."""
+    assert (await client.get("/data/overview", params={"days": 0})).status_code == 422
+    assert (await client.get("/data/overview", params={"days": 5000})).status_code == 422
+    assert (await client.get("/data/overview", params={"limit": 0})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_data_processing_never_calls_today_final(client) -> None:
+    """Суточный архив ЕИС дописывается до полуночи.
+
+    Поэтому «выгружено 42 из 42» за сегодня не означает «за сегодня всё», и
+    сервер сообщает это полем, а не оставляет клиенту выводить правило самому.
+    """
+    body = (await client.get("/data/processing")).json()
+
+    assert body["today"]["final"] is False
+    assert body["today"]["runs_succeeded"] == 42
+
+
+@pytest.mark.asyncio
+async def test_data_processing_reports_both_embedding_denominators(client) -> None:
+    body = (await client.get("/data/processing")).json()
+
+    embeddings = body["embeddings"]
+    assert embeddings["chunks_embedded"] < embeddings["chunks_total"]
+    assert embeddings["tenders_embedded"] < embeddings["tenders_total"]
+    # Воронка документов не пересчитывается здесь заново — она приходит из
+    # того же порта, что и мониторинг.
+    assert body["documents_downloaded"] == 100
+    assert body["documents_extracted"] == 80
+
+
+@pytest.mark.asyncio
+async def test_data_processing_admits_the_broker_is_silent(client) -> None:
+    """Брокер не ответил — это факт о брокере, а не ноль работы в очереди."""
+    body = (await client.get("/data/processing")).json()
+
+    # Очереди эмбеддингов у заглушки нет: значит «не знаю», а не ноль.
+    assert body["embeddings"]["queue_depth"] is None
+
+
+@pytest.mark.asyncio
 async def test_route_table(client) -> None:
     """Снимок путей: маршрут появляется только вместе с правкой этого списка."""
     schema = (await client.get("/openapi.json")).json()
@@ -786,6 +1195,7 @@ async def test_route_table(client) -> None:
         "/tenders/groups",
         "/tenders/{reg_num}",
         "/tenders/{reg_num}/similar",
+        "/crawl",
         "/documents/{document_id}/download",
         "/documents/{document_id}/text",
         "/documents/{document_id}/chunks",
@@ -804,6 +1214,8 @@ async def test_route_table(client) -> None:
         "/monitoring/queues/dead-letters/{message_id}/retry",
         "/monitoring/crawler/runs",
         "/monitoring/documents",
+        "/data/overview",
+        "/data/processing",
         "/settings",
         "/settings/eis-token/rotated",
         "/tenders/{reg_num}/events",
@@ -817,6 +1229,10 @@ async def test_route_table(client) -> None:
         "/views",
         "/wins",
         "/profile",
+        "/research/runs",
+        "/research/runs/{run_id}",
+        "/research/runs/{run_id}/tenders",
+        "/research/runs/{run_id}/market",
         "/system/load-level",
         "/health",
         "/health/ready",
@@ -1164,7 +1580,16 @@ async def test_document_pipeline_funnel_keeps_stage_order(client) -> None:
         "embedded",
     ]
     assert body["funnel"][0]["count"] == 100
-    assert body["failures"] == [{"stage": "failed", "count": 15}]
+    # Отложенное отделено от сбоя: оно ждёт более щедрого прогона, а не сломалось.
+    assert body["failures"] == [
+        {"stage": "failed", "count": 15},
+        {"stage": "deferred", "count": 40},
+    ]
+    # Разбивка причин объясняет разрыв между «скачано» и «извлечён текст».
+    assert body["skip_reasons"] == [
+        {"stage": "tender_budget", "count": 30},
+        {"stage": "multivolume", "count": 10},
+    ]
 
 
 @pytest.mark.asyncio
@@ -1234,6 +1659,27 @@ async def test_load_level_grows_with_the_level(client) -> None:
     assert full["extraction_workers"] >= background["extraction_workers"]
     assert full["llm_concurrency"] > background["llm_concurrency"]
     assert full["eis_rps"] > background["eis_rps"]
+
+
+@pytest.mark.asyncio
+async def test_reported_pool_ignores_the_gateway_memory_limit(
+    client, monkeypatch
+) -> None:
+    """Справка о пуле не должна упираться в память шлюза.
+
+    Шлюз намеренно тесен (448 МиБ) и не разбирает документы — пул живёт в
+    docs-worker с лимитом втрое больше. Пока ответ считался по памяти шлюза,
+    он отдавал один разборщик на всех трёх уровнях: переключатель выглядел
+    ни на что не влияющим, хотя воркер поднимал пять.
+
+    Лимит подставлен: на хосте, где тесты идут без cgroup, поправка по памяти
+    не срабатывает вовсе и подмены бы не было видно.
+    """
+    monkeypatch.setattr(load_policy, "detect_memory_mb", lambda: 448)
+
+    full = (await client.patch("/system/load-level", json={"level": 3})).json()
+
+    assert full["extraction_workers"] == detect_cpu_count()
 
 
 @pytest.mark.asyncio
@@ -1339,3 +1785,59 @@ async def test_facets_count_the_search_result_not_predicates(client, container) 
     # Без текста ограничивать нечем: предикаты и есть выдача.
     await client.get("/tenders/facets", params={"region": ["50"]})
     assert container.facets.restricted_to is None
+
+
+# ─── Исследования ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_research_runs_carry_their_funnel(client) -> None:
+    response = await client.get("/research/runs")
+
+    assert response.status_code == 200
+    card = response.json()[0]
+    assert card["run_id"] == RESEARCH_RUN_ID
+    assert card["confirmed"] == 56
+    # Знаменатель обязателен: «находок 333» без «не прочитано 12» читается как
+    # исчерпывающий ответ, хотя часть корпуса ещё не разобрана.
+    assert card["funnel"]["documents_pending"] == 12
+    assert card["funnel"]["hits_found"] == 333
+
+
+@pytest.mark.asyncio
+async def test_research_tenders_come_with_highlightable_quotes(client) -> None:
+    """Цитата и границы совпадения обязаны доехать до клиента целиком.
+
+    Перенос полей здесь однажды делался через `vars()`, и на доменной модели со
+    `slots=True` маршрут отдавал 500. Заглушка возвращает настоящий доменный
+    объект, поэтому такая правка снова не пройдёт молча.
+    """
+    response = await client.get(f"/research/runs/{RESEARCH_RUN_ID}/tenders")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    hit = body["items"][0]["hits"][0]
+    assert hit["quote"][hit["match_start"] : hit["match_end"]] == "хлоргексидином"
+    assert hit["file_name"] == "ТЗ.pdf"
+    assert hit["page"] == 2
+
+
+@pytest.mark.asyncio
+async def test_research_tenders_refuse_an_unknown_confidence(client) -> None:
+    response = await client.get(
+        f"/research/runs/{RESEARCH_RUN_ID}/tenders", params={"confidence": "хорошие"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_research_market_gives_the_median_next_to_the_mean(client) -> None:
+    response = await client.get(f"/research/runs/{RESEARCH_RUN_ID}/market")
+
+    assert response.status_code == 200
+    body = response.json()
+    # У НМЦК тяжёлый правый хвост: одно среднее описывает рынок, которого нет.
+    assert body["median_price"] is not None
+    assert body["average_price"] is not None
+    assert body["by_region"][0]["label"] == "Московская область"

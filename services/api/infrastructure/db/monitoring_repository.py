@@ -83,6 +83,15 @@ class SqlDocumentPipelineRepository(DocumentPipelinePort):
                     TenderDocument.ocr_used.is_(True)
                 )
             )
+            by_reason = dict(
+                (
+                    await session.execute(
+                        select(TenderDocument.skip_reason, func.count())
+                        .where(TenderDocument.skip_reason.is_not(None))
+                        .group_by(TenderDocument.skip_reason)
+                    )
+                ).all()
+            )
             extracted = await session.scalar(select(func.count()).select_from(DocumentText))
             chunked = await session.scalar(
                 select(func.count(func.distinct(DocumentChunk.document_id)))
@@ -102,10 +111,20 @@ class SqlDocumentPipelineRepository(DocumentPipelinePort):
             embedded=embedded or 0,
             # Отказы показываются по этапам, а не одним числом: «не скачалось»
             # и «не распозналось» чинятся по-разному.
+            # Отложенное показывается отдельно от отклонённого: первое ждёт
+            # более щедрого прогона, второе отвергнуто навсегда. Смешать их
+            # значит потерять различие, ради которого оно и заведено.
             failures=[
                 (status, count)
                 for status, count in sorted(by_status.items())
-                if status in ("failed", "skipped")
+                if status in ("failed", "skipped", "deferred")
+            ],
+            # Почему вложения не взяли. Без разбивки «разобрано 115 тыс. из
+            # 198 тыс.» выглядит поломкой, хотя это работа политики допуска.
+            skip_reasons=[
+                (reason, count)
+                for reason, count in sorted(by_reason.items())
+                if reason
             ],
         )
 

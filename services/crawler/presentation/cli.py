@@ -9,7 +9,6 @@ from datetime import date, timedelta
 
 from libs.shared.config import database_settings, eis_settings, rabbit_settings
 from libs.shared.contracts.events import CrawlRequested, Event
-from libs.shared.db.base import transaction
 from libs.shared.logging import configure_logging, get_logger, set_correlation_id
 from libs.shared.messaging.consumer import EventConsumer
 from libs.shared.messaging.topology import QueueSpec
@@ -131,11 +130,29 @@ async def _listen_for_requests(container: CrawlerContainer) -> None:
 
     async def handle(event: Event) -> None:
         assert isinstance(event, CrawlRequested)
-        await container.crawl_period().execute(
-            regions=event.regions or container.regions,
-            date_from=event.date_from,
-            date_to=event.date_to,
-            document_types=event.document_types or None,
+        if event.job_id is None:
+            # Заявка без задания — докладывать некому.
+            await _execute_request(container, event, progress=None)
+            return
+
+        job_id = str(event.job_id)
+        progress = _JobProgress(container, job_id)
+        try:
+            outcome = await _execute_request(container, event, progress)
+        except Exception as exc:
+            # Ошибка обязана доехать до экрана — и всё равно уйти наверх,
+            # к повторам и dead-letter.
+            await container.jobs.fail(job_id, str(exc))
+            raise
+        await container.jobs.finish(
+            job_id,
+            {
+                "requested": outcome.requested,
+                "skipped": outcome.skipped,
+                "fetched": outcome.fetched,
+                "saved": outcome.saved,
+                "failed": outcome.failed,
+            },
         )
 
     consumer = EventConsumer(container.connection, QUEUE)
@@ -145,22 +162,76 @@ async def _listen_for_requests(container: CrawlerContainer) -> None:
     await asyncio.Event().wait()
 
 
-async def _crawl_days(container: CrawlerContainer, args: argparse.Namespace) -> None:
-    base = args.date or (date.today() - timedelta(days=1))
-    days = [base - timedelta(days=offset) for offset in range(max(args.days_back, 1))]
+#: Единственная фаза выгрузки. Названа всё равно: на экране рядом идут прогоны
+#: с двумя фазами, и безымянная строка выглядела бы недосказанной.
+PHASE_FETCH = "выгрузка дней по регионам"
 
-    for day in days:
-        set_correlation_id()
-        async with transaction(container.session_factory) as session:
-            results = await container.crawl_all(session).execute(day)
-        log.info(
-            "crawl.day_done",
-            day=day.isoformat(),
-            fetched=sum(r.fetched for r in results),
-            saved=sum(r.saved for r in results),
-            new=sum(r.new for r in results),
-            failed=sum(1 for r in results if r.status == "failed"),
-        )
+
+class _JobProgress:
+    """Ход выгрузки → строка задания.
+
+    Адаптер живёт в `presentation`: порт знает только про числа, про таблицу
+    заданий знает инфраструктура, а имя фазы — это подпись на экране.
+    """
+
+    def __init__(self, container: CrawlerContainer, job_id: str) -> None:
+        self._container = container
+        self._job_id = job_id
+        self._total: int | None = None
+
+    async def report(self, processed: int, total: int) -> None:
+        if total != self._total:
+            # Общее число известно только после сверки с журналом покрытия.
+            # `start` — вставка с обновлением, повторный вызов законен.
+            self._total = total
+            await self._container.jobs.start(self._job_id, total, PHASE_FETCH)
+        await self._container.jobs.progress(self._job_id, processed)
+
+
+async def _execute_request(
+    container: CrawlerContainer, event: CrawlRequested, progress: _JobProgress | None
+):
+    return await container.crawl_period(progress).execute(
+        regions=event.regions or container.regions,
+        date_from=event.date_from,
+        date_to=event.date_to,
+        document_types=event.document_types or None,
+    )
+
+
+def _window(args: argparse.Namespace) -> tuple[date, date]:
+    """Окно дневного прохода: `days_back` последних дней, кончая целевым.
+
+    Целевой день — вчерашний: ЕИС отдаёт выгрузку за завершившийся день.
+    """
+    base = args.date or (date.today() - timedelta(days=1))
+    return base - timedelta(days=max(args.days_back, 1) - 1), base
+
+
+async def _crawl_days(container: CrawlerContainer, args: argparse.Namespace) -> None:
+    """Дневной проход — тем же сценарием, что и дозаказ периода.
+
+    Своего сценария у расписания больше нет. Прежний обходил регионы
+    последовательно и в одной транзакции на все: на восьмидесяти пяти субъектах
+    транзакция висела бы весь обход, а события копились бы в outbox до коммита.
+    Заодно проход стал идемпотентным — перезапуск контейнера не перекачивает
+    уже выгруженное.
+    """
+    set_correlation_id()
+    date_from, date_to = _window(args)
+    outcome = await container.crawl_period().execute(
+        regions=container.regions, date_from=date_from, date_to=date_to
+    )
+    log.info(
+        "crawl.window_done",
+        since=date_from.isoformat(),
+        until=date_to.isoformat(),
+        requested=outcome.requested,
+        skipped=outcome.skipped,
+        fetched=outcome.fetched,
+        saved=outcome.saved,
+        failed=outcome.failed,
+    )
 
 
 async def _schedule_loop(
